@@ -1,5 +1,7 @@
 #include "lpms_ffmpeg.h"
 
+#include <libavcodec/avcodec.h>
+
 #include <libavformat/avformat.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
@@ -58,6 +60,8 @@ struct output_ctx {
   int64_t drop_ts;     // preroll audio ts to drop
 
   output_results  *res; // data to return for this output
+
+  int nb_frame; // XXX temp
 };
 
 void lpms_init()
@@ -273,9 +277,15 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     }
     vc->pix_fmt = av_buffersink_get_format(octx->vf.sink_ctx); // XXX select based on encoder + input support
     if (fmt->flags & AVFMT_GLOBALHEADER) vc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    ret = avcodec_open2(vc, codec, &octx->video->opts);
+{
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "forced-idr", "1", 0);
+    av_dict_set(&opts, "flags", "+cgop", 0);
+    ret = avcodec_open2(vc, codec, &opts);
+    //ret = avcodec_open2(vc, codec, &octx->video->opts);
     av_dict_free(&octx->video->opts); // avcodec_open2 replaces this
     if (ret < 0) em_err("Error opening video encoder\n");
+}
   }
 
   // add video stream if input contains video
@@ -717,16 +727,20 @@ int mux(AVPacket *pkt, AVRational tb, struct output_ctx *octx, AVStream *ost)
       if (octx->drop_ts == AV_NOPTS_VALUE) octx->drop_ts = pkt->pts;
       if (pkt->pts && pkt->pts == octx->drop_ts) return 0;
   }
+  if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type) {
+    //fprintf(stderr, "Muxing video\n");
+  }
 
   return av_interleaved_write_frame(octx->oc, pkt);
 }
 
-int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx, AVStream* ost) {
+int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx,
+AVStream* ost, int flush) {
 #define encode_err(msg) { \
   char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
   if (!ret) { fprintf(stderr, "should not happen\n"); ret = AVERROR(ENOMEM); } \
   if (ret < -1) av_strerror(ret, errstr, sizeof errstr); \
-  fprintf(stderr, "%s: %s", msg, errstr); \
+  fprintf(stderr, "%s: %s\n", msg, errstr); \
   goto encode_cleanup; \
 }
 
@@ -735,23 +749,53 @@ int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx, AVS
   if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type && frame) {
     octx->res->frames++;
     octx->res->pixels += encoder->width * encoder->height;
+
+    if  (!octx->nb_frame) {
+      fprintf(stderr, "Forcing IFrame\n");
+      frame->pict_type = AV_PICTURE_TYPE_I;
+    }
+    octx->nb_frame++;
   }
 
-  int ret = avcodec_send_frame(encoder, frame);
-  if (AVERROR_EOF == ret) ; // continue ; drain encoder
-  else if (ret < 0) encode_err("Error sending frame to encoder");
+int ret = 0;
 
+  if (!flush || frame) {
+    ret = avcodec_send_frame(encoder, frame);
+    if (AVERROR_EOF == ret) ; // continue ; drain encoder
+    else if (ret < 0) encode_err("Error sending frame to encoder");
+  }
+
+  if (flush && AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type)  {
+    fprintf(stderr, "Flushing\n");
+    if (!strcmp("nvenc", encoder->codec->wrapper_name)) av_nvenc_flush(encoder); }
+
+  int nb_attempts = 0;
   while (1) {
     av_init_packet(&pkt);
     ret = avcodec_receive_packet(encoder, &pkt);
     if (AVERROR(EAGAIN) == ret || AVERROR_EOF == ret) goto encode_cleanup;
     if (ret < 0) encode_err("Error receiving packet from encoder\n");
+/*
+if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type) {
+uint8_t u = pkt.data[4];
+uint8_t idc = (u & 0x60) >> 5;
+uint8_t *pd = pkt.data;
+uint8_t typ = u & 0x1F;
+      fprintf(stderr, "%.2d nalu type: 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x %d/%d\n", octx->nb_frame, (int)(pkt.data[0]),
+(int)pkt.data[1], (int)pkt.data[2], (int)pkt.data[3], (int)pd[4], (int)pd[5],
+(int)pd[6], (int)pd[7], (int)pkt.data[8], (int)pd[9], typ, idc);
+}
+*/
     ret = mux(&pkt, encoder->time_base, octx, ost);
     if (ret < 0) goto encode_cleanup;
     av_packet_unref(&pkt);
   }
 
 encode_cleanup:
+  if (flush && AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type)  {
+    octx->nb_frame = 0;
+    fprintf(stderr, "Completed flush\n");
+  }
   av_packet_unref(&pkt);
   return ret;
 
@@ -775,7 +819,7 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
 
   if (!filter || !filter->active) {
     // No filter in between decoder and encoder, so use input frame directly
-    return encode(encoder, inf, octx, ost);
+    return encode(encoder, inf, octx, ost, 0);
   }
 
   // Sometimes we have to reset the filter if the HW context is updated
@@ -811,7 +855,7 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
       if (inf) return ret;
       frame = NULL;
     } else if (ret < 0) proc_err("Error consuming the filtergraph\n");
-    ret = encode(encoder, frame, octx, ost);
+    ret = encode(encoder, frame, octx, ost, 0);
     av_frame_unref(frame);
     if (frame == NULL) return ret;
   }
@@ -910,6 +954,137 @@ int lpms_transcode(input_params *inp, output_params *params,
       if (has_frame) ictx.next_pts_a = dframe->pts + dframe->pkt_duration;
     }
 
+    // check for reset and flush if necessary
+  if (ist->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+      dframe->width != prev_w && dframe->height != prev_h) {
+    fprintf(stderr, "res change to %dx%d\n", dframe->width, dframe->height);
+    prev_w = dframe->width;
+    prev_h = dframe->height;
+
+    if (AV_HWDEVICE_TYPE_CUDA == inp->hw_type) goto reuse_encoder; // XXX fix
+
+    // Recreate muxer and encoder. x264 only
+    for (i = 0; i < nb_outputs && after_first; i++) {
+      struct output_ctx *octx = &outputs[i];
+      char fname[128];
+      char filter_str[256];
+      snprintf(fname, sizeof fname, "out/res_%dx%d_%d.ts", dframe->width,
+dframe->height, i);
+      octx->fname = fname;
+
+      // flush output
+      ret = 0;
+      while (!ret || ret == AVERROR(EAGAIN)) {
+       ret = process_out(&ictx, octx, octx->vc, octx->oc->streams[octx->vi],
+&octx->vf, NULL);
+      }
+      while (!ret || ret == AVERROR(EAGAIN)) {
+        ret = process_out(&ictx, octx, octx->ac, octx->oc->streams[octx->ai],
+&octx->af, NULL);
+      }
+      av_interleaved_write_frame(octx->oc, NULL); // flush muxer
+      ret = av_write_trailer(octx->oc);
+      if (ret < 0) main_err("transcoder: Unable to write trailer");
+
+      free_output(octx);
+
+      // reopen output
+      ret = init_video_filters(&ictx, octx);
+      if (ret < 0) main_err("Unable to open video filter\n")
+      snprintf(filter_str, sizeof filter_str,
+"aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100");
+      ret = init_audio_filters(&ictx, octx, filter_str);
+      if (ret < 0) main_err("Unable to open audio filter\n")
+      ret = open_output(octx, &ictx);
+      if (ret < 0) main_err("transcoder: Unable to RE-OPEN input\n");
+
+    }
+    after_first = 1;
+    goto regular_output;
+
+
+    //XXX reuse encoder, recreate muxer. Clean up!!
+reuse_encoder:
+    for (i = 0; i < nb_outputs && after_first; i++) {
+      struct output_ctx *octx = &outputs[i];
+      char fname[128];
+      char filter_str[256];
+      snprintf(fname, sizeof fname, "out/res_%dx%d_%d.ts", dframe->width, dframe->height, i);
+      octx->fname = fname;
+
+      // flush output
+      ret = 0;
+      while (!ret || ret == AVERROR(EAGAIN)) {
+        AVFrame *frame = octx->vf.frame;
+        av_frame_unref(frame);
+        ret = av_buffersrc_write_frame(octx->vf.src_ctx, NULL);
+        if (ret < 0) main_err("Error flushing the video filtergraph\n");
+        int old_ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
+if (!frame || old_ret) fprintf(stderr, "no frame from flush or nonzero ret %d\n",
+old_ret);
+        if (old_ret) frame = NULL;
+        encode(octx->vc, frame, octx, octx->oc->streams[octx->vi], 1);
+        ret = old_ret;
+        if (frame) av_frame_unref(frame);
+      }
+      while (!ret || ret == AVERROR(EAGAIN)) {
+        // XXX check that this actually works
+        AVFrame *frame = octx->af.frame;
+        ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
+        if (ret < 0) main_err("Error flushing the audio filtergraph\n");
+        ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
+        if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai], 0);
+        av_frame_unref(frame);
+      }
+      av_interleaved_write_frame(octx->oc, NULL); // flush muxer
+      ret = av_write_trailer(octx->oc);
+      if (ret < 0) main_err("transcoder: Unable to write trailer");
+      // XXX clean up old muxer context!
+
+      // reopen output
+      ret = init_video_filters(&ictx, octx);
+      if (ret < 0) main_err("Unable to open video filter\n")
+      snprintf(filter_str, sizeof filter_str, "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100"); // set sample format and rate based on encoder support
+      ret = init_audio_filters(&ictx, octx, filter_str);
+      if (ret < 0) main_err("Unable to open audio filter\n")
+
+      AVOutputFormat *fmt = av_guess_format(NULL, octx->fname, NULL);
+      if (!fmt) main_err("Unable to guess format for reopen\n");
+      ret = avformat_alloc_output_context2(&octx->oc, fmt, NULL, fname);
+      if (ret < 0) main_err("Unable to alloc reopened out context\n");
+      // re-attach video encoder
+      if (octx->vc) {
+        AVStream *st = avformat_new_stream(octx->oc, NULL);
+        if (!st) main_err("Unable to re-alloc video stream\n");
+        st->avg_frame_rate = octx->fps;
+        st->time_base = octx->vc->time_base;
+        ret = avcodec_parameters_from_context(st->codecpar, octx->vc);
+        if (ret < 0) main_err("Unable to re-set video stream params\n");
+        octx->vi = st->index;
+      }
+      // re-attach audio encoder
+      if (octx->ac) {
+        AVStream *st = avformat_new_stream(octx->oc, NULL);
+        if (!st) main_err("Unable to re-alloc audio stream\n");
+        ret = avcodec_parameters_from_context(st->codecpar, octx->ac);
+        st->time_base = octx->ac->time_base;
+        if (ret < 0) main_err("Unable to re-copy audio stream params\n");
+        octx->ai = st->index;
+
+        // signal whether to drop preroll audio (???)
+        //if (st->codecpar->initial_padding) octx->drop_ts = AV_NOPTS_VALUE;
+      }
+      if (!(fmt->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&octx->oc->pb, fname, AVIO_FLAG_WRITE);
+        if (ret < 0) main_err("Error re-opening output file\n");
+      }
+      ret = avformat_write_header(octx->oc, NULL);
+      if (ret < 0) main_err("Error re-writing header\n");
+    }
+    after_first = 1;
+  }
+regular_output:
+
     for (i = 0; i < nb_outputs; i++) {
       struct output_ctx *octx = &outputs[i];
       struct filter_ctx *filter = NULL;
@@ -951,48 +1126,6 @@ int lpms_transcode(input_params *inp, output_params *params,
       if (AVERROR(EAGAIN) == ret || AVERROR_EOF == ret) continue;
       else if (ret < 0) main_err("transcoder: Error encoding\n");
     }
-  if (ist->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-    //fprintf(stderr, "processing video %p\n", inf);
-    if (dframe->width != prev_w && dframe->height != prev_h) {
-      fprintf(stderr, "res change to %dx%d\n", dframe->width, dframe->height);
-      prev_w = dframe->width;
-      prev_h = dframe->height;
-      if (!after_first) {
-        after_first = 1;
-        goto whileloop_end;
-      }
-
-      for (i = 0; i < nb_outputs; i++) {
-        struct output_ctx *octx = &outputs[i];
-        char fname[128];
-        char filter_str[256];
-        snprintf(fname, sizeof fname, "out/res_%dx%d_%d.ts", dframe->width, dframe->height, i);
-        octx->fname = fname;
-
-        // flush output
-        ret = 0;
-        while (!ret || ret == AVERROR(EAGAIN)) {
-          ret = process_out(&ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
-        }
-        while (!ret || ret == AVERROR(EAGAIN)) {
-          ret = process_out(&ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
-        }
-        av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-        ret = av_write_trailer(octx->oc);
-        if (ret < 0) main_err("transcoder: Unable to write trailer");
-
-        // reopen output
-        ret = init_video_filters(&ictx, octx);
-        if (ret < 0) main_err("Unable to open video filter\n")
-        snprintf(filter_str, sizeof filter_str, "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100"); // set sample format and rate based on encoder support
-        ret = init_audio_filters(&ictx, octx, filter_str);
-        if (ret < 0) main_err("Unable to open audio filter\n")
-        ret = open_output(octx, &ictx);
-        if (ret < 0) main_err("transcoder: Unable to RE-OPEN input\n");
-      }
-    }
-  }
-
 whileloop_end:
     av_packet_unref(&ipkt);
   }
