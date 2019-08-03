@@ -33,10 +33,13 @@ type ComponentOptions struct {
 	Opts map[string]string
 }
 
+type TranscoderHandle *C.struct_transcode_thread
+
 type TranscodeOptionsIn struct {
 	Fname  string
 	Accel  Acceleration
 	Device string
+	Handle TranscoderHandle
 }
 
 type TranscodeOptions struct {
@@ -56,6 +59,7 @@ type MediaInfo struct {
 }
 
 type TranscodeResults struct {
+	Handle  TranscoderHandle
 	Decoded MediaInfo
 	Encoded []MediaInfo
 }
@@ -150,7 +154,11 @@ func accelDeviceType(accel Acceleration) (C.enum_AVHWDeviceType, error) {
 }
 
 func Transcode2(input *TranscodeOptionsIn, ps []TranscodeOptions) error {
-	_, err := Transcode3(input, ps)
+	res, err := Transcode3(input, ps)
+	if err != nil {
+		return err
+	}
+	C.lpms_transcode_stop((**C.struct_transcode_thread)(&res.Handle))
 	return err
 }
 
@@ -229,7 +237,8 @@ func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 		device = C.CString(input.Device)
 		defer C.free(unsafe.Pointer(device))
 	}
-	inp := &C.input_params{fname: fname, hw_type: hw_type, device: device}
+	inp := &C.input_params{fname: fname, hw_type: hw_type, device: device,
+		handle: input.Handle}
 	results := make([]C.output_results, len(ps))
 	decoded := &C.output_results{}
 	var (
@@ -256,7 +265,11 @@ func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 		Frames: int(decoded.frames),
 		Pixels: int64(decoded.pixels),
 	}
-	return &TranscodeResults{Encoded: tr, Decoded: dec}, nil
+	return &TranscodeResults{Handle: inp.handle, Encoded: tr, Decoded: dec}, nil
+}
+
+func TranscodeStop(handle *TranscoderHandle) {
+	C.lpms_transcode_stop((**C.struct_transcode_thread)(handle))
 }
 
 func InitFFmpeg() {
