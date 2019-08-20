@@ -1296,21 +1296,19 @@ int lpms_transcode(input_params *inp, output_params *params,
   return ret;
 }
 
-void lpms_transcode_stop(struct transcode_thread **handle) {
+void lpms_transcode_stop(struct transcode_thread *handle) {
   // not threadsafe as-is; calling function must ensure exclusivity!
 
-  if (!*handle) return;
+  if (!handle) return;
 
-  struct transcode_thread *h = *handle;
-  pthread_mutex_lock(&h->mu);
+  pthread_mutex_lock(&handle->mu);
   // Should we check for running status?
-  h->action = TRANSCODE_ACTION_STOP;
-  pthread_cond_signal(&h->in_cv);
-  pthread_mutex_unlock(&h->mu);
+  handle->action = TRANSCODE_ACTION_STOP;
+  pthread_cond_signal(&handle->in_cv);
+  pthread_mutex_unlock(&handle->mu);
 
   // wait for transcode thread to complete
-  pthread_join(h->th, NULL);
+  pthread_join(handle->th, NULL);
 
-  free(h);
-  *handle = NULL;
+  free(handle);
 }

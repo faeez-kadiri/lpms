@@ -158,7 +158,7 @@ func Transcode2(input *TranscodeOptionsIn, ps []TranscodeOptions) error {
 	if err != nil {
 		return err
 	}
-	C.lpms_transcode_stop((**C.struct_transcode_thread)(&res.Handle))
+	TranscodeStop(&res.Handle)
 	return err
 }
 
@@ -269,7 +269,8 @@ func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 }
 
 func TranscodeStop(handle *TranscoderHandle) {
-	C.lpms_transcode_stop((**C.struct_transcode_thread)(handle))
+	C.lpms_transcode_stop(*handle)
+	handle = nil // do this here bc double pointer params are hard in cgo
 }
 
 func InitFFmpeg() {
