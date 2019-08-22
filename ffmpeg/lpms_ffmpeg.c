@@ -1225,6 +1225,7 @@ static void* transcode_loop(void *arg) {
 
 tloop_cleanup:
   //ret = -1; // XXX custom error as needed
+  h->ret = ret;
   h->running = 0;
   h->action = TRANSCODE_ACTION_NONE;
   pthread_cond_signal(&h->out_cv);
@@ -1256,10 +1257,12 @@ int lpms_transcode(input_params *inp, output_params *params,
 
     pthread_mutex_lock(&h->mu);
     pthread_create(&h->th, NULL, transcode_loop, h);
-    while (h->action != TRANSCODE_ACTION_READY) {
+    while (h->running && h->action != TRANSCODE_ACTION_READY) {
       pthread_cond_wait(&h->out_cv, &h->mu);
     }
+    ret = h->ret;
     pthread_mutex_unlock(&h->mu);
+    if (ret) return ret;
     fprintf(stderr, "treanscode thread ready\n");
   }
   pthread_mutex_lock(&h->mu);
