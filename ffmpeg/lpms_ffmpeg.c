@@ -14,7 +14,6 @@
 const int lpms_ERR_INPUT_PIXFMT = FFERRTAG('I','N','P','X');
 const int lpms_ERR_FILTERS = FFERRTAG('F','L','T','R');
 const int lpms_ERR_PACKET_ONLY = FFERRTAG('P','K','O','N');
-const int lpms_ERR_STOPPED = FFERRTAG('S','T','O','P');
 
 //
 // Internal transcoder data structures
@@ -67,27 +66,16 @@ struct output_ctx {
   int nb_frame; // XXX temp
 };
 
-#define TRANSCODE_ACTION_NONE 0
-#define TRANSCODE_ACTION_RUN  1
-#define TRANSCODE_ACTION_STOP 2
-#define TRANSCODE_ACTION_READY 3
+#define MAX_OUTPUT_SIZE 10
 
 struct transcode_thread {
-  pthread_t th;
   pthread_mutex_t mu;
-  pthread_cond_t in_cv, out_cv;
-
-  int action; // 0 undfined, 1 for transcode, 2 for stop
-  int running;
-  int ret;
 
   int first; // XXX ugly; fix!
 
-  // params
-  input_params *inp;
-  output_params *params;
-  output_results *results;
-  output_results *decoded_results;
+  struct input_ctx ictx;
+  struct output_ctx outputs[MAX_OUTPUT_SIZE];
+
   int nb_outputs;
 
 };
@@ -901,9 +889,9 @@ proc_cleanup:
 #undef proc_err
 }
 
-#define MAX_OUTPUT_SIZE 10
-
-static int transcode(struct transcode_thread *h, struct input_ctx *ictx, struct output_ctx *outputs)
+int transcode(struct transcode_thread *h,
+  input_params *inp, output_params *params,
+  output_results *results, output_results *decoded_results)
 {
 #define main_err(msg) { \
   char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
@@ -914,8 +902,8 @@ static int transcode(struct transcode_thread *h, struct input_ctx *ictx, struct 
 }
   int ret = 0, i = 0;
   int decode_a = 0, decode_v = 0;
-  input_params *inp = h->inp;
-  output_params *params = h->params;
+  struct input_ctx *ictx = &h->ictx;
+  struct output_ctx *outputs = h->outputs;
   int nb_outputs = h->nb_outputs;
   AVPacket ipkt;
   AVFrame *dframe = NULL;
@@ -950,7 +938,7 @@ static int transcode(struct transcode_thread *h, struct input_ctx *ictx, struct 
       if (params[i].fps.den) octx->fps = params[i].fps;
       octx->dv = ictx.vi < 0 || is_drop(octx->video->name);
       octx->da = ictx.ai < 0 || is_drop(octx->audio->name);
-      octx->res = &h->results[i];
+      octx->res = &results[i];
       if (ictx->vc) {
         ret = init_video_filters(ictx, octx);
         if (ret < 0) main_err("Unable to open video filter");
@@ -1064,6 +1052,7 @@ begin_flush:
 
       free_output(octx);
     }
+    if (AVERROR(EAGAIN) == ret) ret = 0;
     break;
 
 
@@ -1183,57 +1172,6 @@ transcode_cleanup:
 #undef main_err
 }
 
-static void* transcode_loop(void *arg) {
-
-#define tl_err(msg) { \
-  char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
-  if (!ret) ret = AVERROR(EINVAL); \
-  if (ret < -1) av_strerror(ret, errstr, sizeof errstr); \
-  fprintf(stderr, "%s: %s\n", msg, errstr); \
-  goto tloop_cleanup; \
-}
-
-  struct transcode_thread *h = (struct transcode_thread*)arg;
-  struct input_ctx ictx;
-  struct output_ctx outputs[MAX_OUTPUT_SIZE];
-  int ret;
-  pthread_mutex_lock(&h->mu);
-  if (h->nb_outputs > MAX_OUTPUT_SIZE) {
-    h->ret = -1; // XXX add custom error??
-    tl_err("too many outputs")
-  }
-  ret = open_input(h->inp, &ictx);
-  if (ret < 0)  tl_err("could not open input");
-  h->action = TRANSCODE_ACTION_READY;
-  pthread_cond_signal(&h->out_cv);
-  while (h->running) {
-
-    pthread_cond_wait(&h->in_cv, &h->mu);
-    switch (h->action) {
-      default:
-        fprintf(stderr, "Stop transcoder: unknown action %d\n", h->action);
-      case TRANSCODE_ACTION_STOP:
-        h->running = 0;
-        continue;
-      case TRANSCODE_ACTION_NONE: continue;
-      case TRANSCODE_ACTION_RUN: break;
-    }
-    h->ret = transcode(h, &ictx, (struct output_ctx*)&outputs[0]);
-    h->action = TRANSCODE_ACTION_NONE; // reset action
-    pthread_cond_signal(&h->out_cv);
-  }
-
-tloop_cleanup:
-  //ret = -1; // XXX custom error as needed
-  h->ret = ret;
-  h->running = 0;
-  h->action = TRANSCODE_ACTION_NONE;
-  pthread_cond_signal(&h->out_cv);
-  pthread_mutex_unlock(&h->mu);
-
-#undef tl_err
-}
-
 int lpms_transcode(input_params *inp, output_params *params,
   output_results *results, int nb_outputs, output_results *decoded_results)
 {
@@ -1246,56 +1184,30 @@ int lpms_transcode(input_params *inp, output_params *params,
     if (!h) return ENOMEM;
     memset(h, 0, sizeof *h);
 
-    h->running = 1;
     pthread_mutex_init(&h->mu, NULL);
-    pthread_cond_init(&h->in_cv, NULL);
-    pthread_cond_init(&h->out_cv, NULL);
 
-    h->inp = inp;
     h->nb_outputs = nb_outputs;
     h->first = 1;
 
-    pthread_mutex_lock(&h->mu);
-    pthread_create(&h->th, NULL, transcode_loop, h);
-    while (h->running && h->action != TRANSCODE_ACTION_READY) {
-      pthread_cond_wait(&h->out_cv, &h->mu);
+    ret = open_input(inp, &h->ictx);
+    if (ret < 0) {
+      free(h);
+      return ret;
     }
-    ret = h->ret;
-    pthread_mutex_unlock(&h->mu);
-    if (ret) return ret;
-    fprintf(stderr, "treanscode thread ready\n");
+
+    fprintf(stderr, "transcode thread ready\n");
   }
   pthread_mutex_lock(&h->mu);
-  if (!h->running) {
-    pthread_mutex_unlock(&h->mu);
-    fprintf(stderr, "Attempted to use stopped transcode loop\n");
-    return lpms_ERR_STOPPED;
-  }
   inp->handle = h; // XXX don't like modifying input struct here
-
-  // TEMP
-/*
-  int ret = transcode(inp, params, nb_outputs);
-  h->first = 0;
-  pthread_mutex_unlock(&h->mu);
-  return ret;
-*/
 
   if (h->nb_outputs != nb_outputs) fprintf(stderr, "very bad!\n"); // XXX fix
 
-  h->action = TRANSCODE_ACTION_RUN;
-  h->inp = inp;
-  h->params = params;
-  h->results = results;
-  h->nb_outputs = nb_outputs;
-  h->decoded_results = decoded_results;
-  pthread_cond_signal(&h->in_cv);
-  while (h->action == TRANSCODE_ACTION_RUN) {
-    pthread_cond_wait(&h->out_cv, &h->mu);
-  }
+  inp = inp;
+  ret = transcode(h, inp, params, results, decoded_results);
   h->first = 0;
-  ret = h->ret;
+
   pthread_mutex_unlock(&h->mu);
+
   return ret;
 }
 
@@ -1305,13 +1217,7 @@ void lpms_transcode_stop(struct transcode_thread *handle) {
   if (!handle) return;
 
   pthread_mutex_lock(&handle->mu);
-  // Should we check for running status?
-  handle->action = TRANSCODE_ACTION_STOP;
-  pthread_cond_signal(&handle->in_cv);
   pthread_mutex_unlock(&handle->mu);
-
-  // wait for transcode thread to complete
-  pthread_join(handle->th, NULL);
 
   free(handle);
 }
