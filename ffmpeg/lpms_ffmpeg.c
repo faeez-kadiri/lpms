@@ -906,6 +906,27 @@ proc_cleanup:
 #undef proc_err
 }
 
+int flush_outputs(struct input_ctx *ictx, struct output_ctx *octx)
+{
+    // only issue w this flushing method is it's not necessarily sequential
+    // wrt all the outputs; might want to iterate on each output per frame?
+    int ret = 0;
+    if (octx->vc) { // flush video
+      while (!ret || ret == AVERROR(EAGAIN)) {
+        ret = process_out(ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
+      }
+    }
+    ret = 0;
+    if (octx->ac) { // flush audio
+      while (!ret || ret == AVERROR(EAGAIN)) {
+        ret = process_out(ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
+      }
+    }
+    av_interleaved_write_frame(octx->oc, NULL); // flush muxer
+    return av_write_trailer(octx->oc);
+}
+
+
 int transcode(struct transcode_thread *h,
   input_params *inp, output_params *params,
   output_results *results, output_results *decoded_results)
@@ -1156,26 +1177,9 @@ whileloop_end:
     av_packet_unref(&ipkt);
   }
 
-  // flush outputs
   for (i = 0; i < nb_outputs; i++) {
-    struct output_ctx *octx = &outputs[i];
-    // only issue w this flushing method is it's not necessarily sequential
-    // wrt all the outputs; might want to iterate on each output per frame?
-    ret = 0;
-    if (octx->vc) { // flush video
-      while (!ret || ret == AVERROR(EAGAIN)) {
-        ret = process_out(ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
-      }
-    }
-    ret = 0;
-    if (octx->ac) { // flush audio
-      while (!ret || ret == AVERROR(EAGAIN)) {
-        ret = process_out(ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
-      }
-    }
-    av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-    ret = av_write_trailer(octx->oc);
-    if (ret < 0) main_err("transcoder: Unable to write trailer");
+    ret = flush_outputs(ictx, &outputs[i]);
+    if (ret < 0) main_err("transcoder: Unable to fully flush outputs")
   }
 
 transcode_cleanup:
