@@ -71,7 +71,7 @@ struct output_ctx {
 struct transcode_thread {
   pthread_mutex_t mu;
 
-  int first; // XXX ugly; fix!
+  int initialized;
 
   struct input_ctx ictx;
   struct output_ctx outputs[MAX_OUTPUT_SIZE];
@@ -398,28 +398,16 @@ static void free_input(struct input_ctx *inctx)
   if (inctx->hw_device_ctx) av_buffer_unref(&inctx->hw_device_ctx);
 }
 
-static int open_input(input_params *params, struct input_ctx *ctx)
+int open_decoders(input_params *params, struct input_ctx *ctx)
 {
 #define dd_err(msg) { \
   if (!ret) ret = -1; \
   fprintf(stderr, msg); \
-  goto open_input_err; \
+  goto open_decoder_err; \
 }
-  AVCodec *codec = NULL;
-  AVFormatContext *ic   = NULL;
-  char *inp = params->fname;
   int ret;
-
-  // open demuxer
-  ic = avformat_alloc_context();
-  if (!ic) dd_err("demuxer: Unable to alloc context\n");
-  ret = avio_open(&ic->pb, inp, AVIO_FLAG_READ);
-  if (ret < 0) dd_err("demuxer: Unable to open file\n");
-  ret = avformat_open_input(&ic, NULL, NULL, NULL);
-  if (ret < 0) dd_err("demuxer: Unable to open input\n");
-  ctx->ic = ic;
-  ret = avformat_find_stream_info(ic, NULL);
-  if (ret < 0) dd_err("Unable to find input info\n");
+  AVCodec *codec = NULL;
+  AVFormatContext *ic = ctx->ic;
 
   // open video decoder
   ctx->vi = av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
@@ -479,6 +467,38 @@ static int open_input(input_params *params, struct input_ctx *ctx)
     ret = avcodec_open2(ac, codec, NULL);
     if (ret < 0) dd_err("Unable to open audio decoder\n");
   }
+
+  return 0;
+
+open_decoder_err:
+  free_input(ctx);
+  return ret;
+#undef dd_err
+}
+
+static int open_input(input_params *params, struct input_ctx *ctx)
+{
+#define dd_err(msg) { \
+  if (!ret) ret = -1; \
+  fprintf(stderr, msg); \
+  goto open_input_err; \
+}
+  AVFormatContext *ic   = NULL;
+  char *inp = params->fname;
+  int ret;
+
+  // open demuxer
+  ic = avformat_alloc_context();
+  if (!ic) dd_err("demuxer: Unable to alloc context\n");
+  ret = avio_open(&ic->pb, inp, AVIO_FLAG_READ);
+  if (ret < 0) dd_err("demuxer: Unable to open file\n");
+  ret = avformat_open_input(&ic, NULL, NULL, NULL);
+  if (ret < 0) dd_err("demuxer: Unable to open input\n");
+  ctx->ic = ic;
+  ret = avformat_find_stream_info(ic, NULL);
+  if (ret < 0) dd_err("Unable to find input info\n");
+  ret = open_decoders(params, ctx);
+  if (ret < 0) dd_err("Unable to open decoder")
 
   return 0;
 
@@ -719,8 +739,6 @@ dec_cleanup:
 
 dec_flush:
 
-  //fprintf(stderr, "Got EOF for IO\n");
-  avio_closep(&ictx->ic->pb);
 
   if (ictx->vc) {
     //avcodec_send_packet(ictx->vc, NULL); XXX fix
@@ -774,8 +792,7 @@ AVStream* ost, int flush) {
   if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type && frame) {
     octx->res->frames++;
     octx->res->pixels += encoder->width * encoder->height;
-
-    if  (!octx->nb_frame) {
+    if (!octx->nb_frame) {
       //fprintf(stderr, "Forcing IFrame\n");
       frame->pict_type = AV_PICTURE_TYPE_I;
     }
@@ -917,12 +934,11 @@ int transcode(struct transcode_thread *h,
     if (!needs_decoder(params[i].audio.name)) ictx.da = ++decode_a == nb_outputs;
   }
 
-  // populate input context
-  //ret = open_input(inp, &ictx);
-  //if (ret < 0) main_err("transcoder: Unable to open input\n");
-
   if (!ictx->ic->pb) {
-    avio_open(&ictx->ic->pb, inp->fname, AVIO_FLAG_READ);
+    ret = avio_open(&ictx->ic->pb, inp->fname, AVIO_FLAG_READ);
+    if (ret < 0) main_err("Unable to reopen file");
+    if (AV_HWDEVICE_TYPE_CUDA != ictx->hw_type) ret = open_decoders(inp, ictx);
+    if (ret < 0) main_err("Unable to reopen decoders");
   }
 
   // populate output contexts
@@ -950,7 +966,7 @@ int transcode(struct transcode_thread *h,
         if (ret < 0) main_err("Unable to open audio filter");
       }
 
-      if (h->first) {
+      if (!h->initialized || AV_HWDEVICE_TYPE_NONE == inp->hw_type) {
         ret = open_output(octx, ictx);
         if (ret < 0) main_err("transcoder: Unable to open output");
         continue;
@@ -1141,32 +1157,29 @@ whileloop_end:
   }
 
   // flush outputs
-/*
   for (i = 0; i < nb_outputs; i++) {
-    struct output_ctx *octx = &inp->handle->outputs[i];
+    struct output_ctx *octx = &outputs[i];
     // only issue w this flushing method is it's not necessarily sequential
     // wrt all the outputs; might want to iterate on each output per frame?
     ret = 0;
     if (octx->vc) { // flush video
       while (!ret || ret == AVERROR(EAGAIN)) {
-        ret = process_out(&ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
+        ret = process_out(ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
       }
     }
     ret = 0;
     if (octx->ac) { // flush audio
       while (!ret || ret == AVERROR(EAGAIN)) {
-        ret = process_out(&ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
+        ret = process_out(ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
       }
     }
     av_interleaved_write_frame(octx->oc, NULL); // flush muxer
     ret = av_write_trailer(octx->oc);
     if (ret < 0) main_err("transcoder: Unable to write trailer");
   }
-*/
 
 transcode_cleanup:
-  //free_input(&ictx);
-  //for (i = 0; i < MAX_OUTPUT_SIZE; i++) free_output(&inp->handle->outputs[i]);
+  avio_closep(&ictx->ic->pb);
   if (dframe) av_frame_free(&dframe);
   return ret == AVERROR_EOF ? 0 : ret;
 #undef main_err
@@ -1177,46 +1190,48 @@ int lpms_transcode(input_params *inp, output_params *params,
 {
   int ret = 0;
   struct transcode_thread *h = inp->handle;
-// if no transcoder exists, allocate a new one
-  if (!h) {
-    fprintf(stderr, "Creating a new transcode thread\n");
-    h = malloc(sizeof (struct transcode_thread));
-    if (!h) return ENOMEM;
-    memset(h, 0, sizeof *h);
 
-    pthread_mutex_init(&h->mu, NULL);
+  pthread_mutex_lock(&h->mu);
+  if (!h->initialized) {
+    fprintf(stderr, "Initializing new transcode thread\n");
 
     h->nb_outputs = nb_outputs;
-    h->first = 1;
 
+    // populate input context
     ret = open_input(inp, &h->ictx);
-    if (ret < 0) {
-      free(h);
-      return ret;
-    }
+    if (ret < 0) return ret;
 
     fprintf(stderr, "transcode thread ready\n");
   }
-  pthread_mutex_lock(&h->mu);
-  inp->handle = h; // XXX don't like modifying input struct here
 
   if (h->nb_outputs != nb_outputs) fprintf(stderr, "very bad!\n"); // XXX fix
 
-  inp = inp;
   ret = transcode(h, inp, params, results, decoded_results);
-  h->first = 0;
+  h->initialized = 1;
 
   pthread_mutex_unlock(&h->mu);
 
   return ret;
 }
 
+struct transcode_thread* lpms_transcode_new() {
+  struct transcode_thread *h = malloc(sizeof (struct transcode_thread));
+  if (!h) return NULL;
+  memset(h, 0, sizeof *h);
+  pthread_mutex_init(&h->mu, NULL);
+  return h;
+}
+
 void lpms_transcode_stop(struct transcode_thread *handle) {
   // not threadsafe as-is; calling function must ensure exclusivity!
+
+  int i;
 
   if (!handle) return;
 
   pthread_mutex_lock(&handle->mu);
+  free_input(&handle->ictx);
+  for (i = 0; i < MAX_OUTPUT_SIZE; i++) free_output(&handle->outputs[i]);
   pthread_mutex_unlock(&handle->mu);
 
   free(handle);

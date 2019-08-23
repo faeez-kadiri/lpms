@@ -154,15 +154,18 @@ func accelDeviceType(accel Acceleration) (C.enum_AVHWDeviceType, error) {
 }
 
 func Transcode2(input *TranscodeOptionsIn, ps []TranscodeOptions) error {
-	res, err := Transcode3(input, ps)
-	if err != nil {
-		return err
-	}
-	TranscodeStop(&res.Handle)
+	_, err := Transcode3(input, ps)
 	return err
 }
 
 func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeResults, error) {
+	handle := NewTranscoder()
+	defer StopTranscoder(&handle)
+	input.Handle = handle
+	return Transcode4(input, ps)
+}
+
+func Transcode4(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeResults, error) {
 	if input == nil {
 		return nil, ErrTranscoderInp
 	}
@@ -268,7 +271,11 @@ func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 	return &TranscodeResults{Handle: inp.handle, Encoded: tr, Decoded: dec}, nil
 }
 
-func TranscodeStop(handle *TranscoderHandle) {
+func NewTranscoder() TranscoderHandle {
+	return C.lpms_transcode_new()
+}
+
+func StopTranscoder(handle *TranscoderHandle) {
 	C.lpms_transcode_stop(*handle)
 	handle = nil // do this here bc double pointer params are hard in cgo
 }
