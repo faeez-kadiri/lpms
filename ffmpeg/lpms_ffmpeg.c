@@ -906,24 +906,62 @@ proc_cleanup:
 #undef proc_err
 }
 
+int flush_cuda(struct output_ctx *octx) {
+#define cudaf_err(msg) { \
+  char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
+  if (!ret) ret = AVERROR(EINVAL); \
+  if (ret < -1) av_strerror(ret, errstr, sizeof errstr); \
+  fprintf(stderr, "%s: %s\n", msg, errstr); \
+  return ret; \
+}
+      int ret = 0;
+      while (octx->vc && (!ret || ret == AVERROR(EAGAIN))) {
+        AVFrame *frame = octx->vf.frame;
+        av_frame_unref(frame);
+        ret = av_buffersrc_write_frame(octx->vf.src_ctx, NULL);
+        if (ret < 0) cudaf_err("Error flushing the video filtergraph\n");
+        ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
+        if (ret) frame = NULL;
+        encode(octx->vc, frame, octx, octx->oc->streams[octx->vi], 1);
+        if (frame) av_frame_unref(frame);
+      }
+      ret = 0;
+      while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
+        // XXX check that this actually works
+        AVFrame *frame = octx->af.frame;
+        ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
+        if (ret < 0) cudaf_err("Error flushing the audio filtergraph\n");
+        ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
+        if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai], 0);
+        av_frame_unref(frame);
+      }
+      av_interleaved_write_frame(octx->oc, NULL); // flush muxer
+      ret = av_write_trailer(octx->oc);
+      if (ret < 0) cudaf_err("transcoder: Unable to write trailer");
+      if (!(octx->oc->oformat->flags & AVFMT_NOFILE) && octx->oc->pb) {
+        avio_closep(&octx->oc->pb);
+      }
+#undef cudaf_err
+}
+
 int flush_outputs(struct input_ctx *ictx, struct output_ctx *octx)
 {
-    // only issue w this flushing method is it's not necessarily sequential
-    // wrt all the outputs; might want to iterate on each output per frame?
-    int ret = 0;
-    if (octx->vc) { // flush video
-      while (!ret || ret == AVERROR(EAGAIN)) {
-        ret = process_out(ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
-      }
+  // only issue w this flushing method is it's not necessarily sequential
+  // wrt all the outputs; might want to iterate on each output per frame?
+  int ret = 0;
+  if (octx->vc) { // flush video
+    while (!ret || ret == AVERROR(EAGAIN)) {
+      ret = process_out(ictx, octx, octx->vc, octx->oc->streams[octx->vi], &octx->vf, NULL);
     }
-    ret = 0;
-    if (octx->ac) { // flush audio
-      while (!ret || ret == AVERROR(EAGAIN)) {
-        ret = process_out(ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
-      }
+  }
+  ret = 0;
+  if (octx->ac) { // flush audio
+    while (!ret || ret == AVERROR(EAGAIN)) {
+      ret = process_out(ictx, octx, octx->ac, octx->oc->streams[octx->ai], &octx->af, NULL);
     }
-    av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-    return av_write_trailer(octx->oc);
+  }
+  av_interleaved_write_frame(octx->oc, NULL); // flush muxer
+  return av_write_trailer(octx->oc);
 }
 
 
@@ -1048,7 +1086,6 @@ int transcode(struct transcode_thread *h,
     if (ret == AVERROR_EOF) break;
                             // Bail out on streams that appear to be broken
     else if (lpms_ERR_PACKET_ONLY == ret) ; // keep going for stream copy
-    else if (AVERROR(EAGAIN) == ret) goto begin_flush;
     else if (ret < 0) main_err("transcoder: Could not decode; stopping\n");
     ist = ictx.ic->streams[ipkt.stream_index];
     has_frame = lpms_ERR_PACKET_ONLY != ret;
@@ -1061,76 +1098,6 @@ int transcode(struct transcode_thread *h,
     } else if (AVMEDIA_TYPE_AUDIO == ist->codecpar->codec_type) {
       if (has_frame) ictx.next_pts_a = dframe->pts + dframe->pkt_duration;
     }
-
-    // check for reset and flush if necessary
-begin_flush:
-  if (AVERROR(EAGAIN) == ret) {
-    //fprintf(stderr, "Beign flush process\n");
-
-    if (AV_HWDEVICE_TYPE_CUDA == inp->hw_type) goto reuse_encoder; // XXX fix
-
-    // Recreate muxer and encoder. x264 only
-    for (i = 0; i < nb_outputs; i++) {
-      struct output_ctx *octx = &outputs[i];
-
-      // flush output
-      ret = 0;
-      while (octx->vc && (!ret || ret == AVERROR(EAGAIN))) {
-       ret = process_out(ictx, octx, octx->vc, octx->oc->streams[octx->vi],
-&octx->vf, NULL);
-      }
-      while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
-        ret = process_out(ictx, octx, octx->ac, octx->oc->streams[octx->ai],
-&octx->af, NULL);
-      }
-      av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-      ret = av_write_trailer(octx->oc);
-      if (ret < 0) main_err("transcoder: Unable to write trailer");
-
-      free_output(octx);
-    }
-    if (AVERROR(EAGAIN) == ret) ret = 0;
-    break;
-
-
-    //XXX reuse encoder, recreate muxer. Clean up!!
-reuse_encoder:
-    for (i = 0; i < nb_outputs; i++) {
-      struct output_ctx *octx = &outputs[i];
-
-      // flush output
-      ret = 0;
-      while (octx->vc && (!ret || ret == AVERROR(EAGAIN))) {
-        AVFrame *frame = octx->vf.frame;
-        av_frame_unref(frame);
-        ret = av_buffersrc_write_frame(octx->vf.src_ctx, NULL);
-        if (ret < 0) main_err("Error flushing the video filtergraph\n");
-        int old_ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
-//if (!frame || old_ret) fprintf(stderr, "no frame from flush or nonzero ret %d\n", old_ret);
-        if (old_ret) frame = NULL;
-        encode(octx->vc, frame, octx, octx->oc->streams[octx->vi], 1);
-        ret = old_ret;
-        if (frame) av_frame_unref(frame);
-      }
-      while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
-        // XXX check that this actually works
-        AVFrame *frame = octx->af.frame;
-        ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
-        if (ret < 0) main_err("Error flushing the audio filtergraph\n");
-        ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
-        if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai], 0);
-        av_frame_unref(frame);
-      }
-      av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-      ret = av_write_trailer(octx->oc);
-      if (ret < 0) main_err("transcoder: Unable to write trailer");
-      if (!(octx->oc->oformat->flags & AVFMT_NOFILE) && octx->oc->pb) {
-        avio_closep(&octx->oc->pb);
-      }
-      // XXX clean up old muxer context!
-    }
-    break;
-  }
 
     for (i = 0; i < nb_outputs; i++) {
       struct output_ctx *octx = &outputs[i];
@@ -1178,7 +1145,8 @@ whileloop_end:
   }
 
   for (i = 0; i < nb_outputs; i++) {
-    ret = flush_outputs(ictx, &outputs[i]);
+    if (AV_HWDEVICE_TYPE_CUDA == ictx->hw_type) ret = flush_cuda(&outputs[i]);
+    else ret = flush_outputs(ictx, &outputs[i]);
     if (ret < 0) main_err("transcoder: Unable to fully flush outputs")
   }
 
