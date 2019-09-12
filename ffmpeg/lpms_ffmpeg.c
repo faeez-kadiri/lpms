@@ -7,6 +7,7 @@
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 
 #include <pthread.h>
 
@@ -31,6 +32,9 @@ struct input_ctx {
   char *device;
 
   int64_t next_pts_a, next_pts_v;
+
+AVPacket *first;
+int flushed;
 };
 
 struct filter_ctx {
@@ -226,6 +230,23 @@ static int needs_decoder(char *encoder) {
   return !(is_copy(encoder) || is_drop(encoder));
 }
 
+static int is_flush_frame(AVFrame *frame)
+{
+  return -1 == frame->pts;
+}
+
+static void send_first(struct input_ctx *ictx)
+{
+  if (ictx->flushed || !ictx->first) return;
+
+  int ret = avcodec_send_packet(ictx->vc, ictx->first);
+  if (ret < 0) {
+    char errstr[AV_ERROR_MAX_STRING_SIZE];
+    av_strerror(ret, errstr, sizeof errstr);
+    fprintf(stderr, "error sending packet %d / %s\n", ret, errstr);
+  }
+}
+
 static enum AVPixelFormat hw2pixfmt(AVCodecContext *ctx)
 {
   const AVCodec *decoder = ctx->codec;
@@ -275,6 +296,13 @@ static enum AVPixelFormat get_hw_pixfmt(AVCodecContext *vc, const enum AVPixelFo
     fprintf(stderr,"Unable to initialize a hardware frame pool\n");
     return AV_PIX_FMT_NONE;
   }
+
+fprintf(stderr, "selected format: hw %s sw %s\n",
+av_get_pix_fmt_name(frames->format), av_get_pix_fmt_name(frames->sw_format));
+const enum AVPixelFormat *p;
+for (p = pix_fmts; *p != -1; p++) {
+fprintf(stderr,"possible format: %s\n", av_get_pix_fmt_name(*p));
+}
 
   return frames->format;
 }
@@ -749,6 +777,11 @@ int process_in(struct input_ctx *ictx, AVFrame *frame, AVPacket *pkt)
     else if (pkt->stream_index == ictx->vi || pkt->stream_index == ictx->ai) break;
     else dec_err("Could not find decoder or stream\n");
 
+    if (!ictx->first && pkt->flags & AV_PKT_FLAG_KEY) {
+      ictx->first = av_packet_clone(pkt);
+      ictx->first->pts = -1;
+    }
+
     ret = avcodec_send_packet(decoder, pkt);
     if (ret < 0) dec_err("Error sending packet to decoder\n");
     ret = avcodec_receive_frame(decoder, frame);
@@ -767,19 +800,27 @@ dec_cleanup:
 
 dec_flush:
 
+  // Flush and close decoder for non-CUDA
 
   if (ictx->vc) {
-    //avcodec_send_packet(ictx->vc, NULL); XXX fix
+send_first(ictx);
+
+    //avcodec_send_packet(ictx->vc, NULL); // XXX fix
     ret = avcodec_receive_frame(ictx->vc, frame);
     pkt->stream_index = ictx->vi; // XXX ugly?
-    if (!ret) return ret;
+    if (!ret) {
+      if (is_flush_frame(frame)) ictx->flushed = 1;
+      return ret;
+    }
   }
   if (ictx->ac) {
-    //avcodec_send_packet(ictx->ac, NULL); XXX fix
+fprintf(stderr, "got audio?\n");
+    avcodec_send_packet(ictx->ac, NULL); // XXX fix
     ret = avcodec_receive_frame(ictx->ac, frame);
     pkt->stream_index = ictx->ai; // XXX ugly?
+    if (!ret) return ret;
   }
-  return ret;
+  return AVERROR_EOF;
 
 #undef dec_err
 }
@@ -845,17 +886,6 @@ int ret = 0;
     ret = avcodec_receive_packet(encoder, &pkt);
     if (AVERROR(EAGAIN) == ret || AVERROR_EOF == ret) goto encode_cleanup;
     if (ret < 0) encode_err("Error receiving packet from encoder\n");
-/*
-if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type) {
-uint8_t u = pkt.data[4];
-uint8_t idc = (u & 0x60) >> 5;
-uint8_t *pd = pkt.data;
-uint8_t typ = u & 0x1F;
-      fprintf(stderr, "%.2d nalu type: 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x 0x%.2x %d/%d\n", octx->nb_frame, (int)(pkt.data[0]),
-(int)pkt.data[1], (int)pkt.data[2], (int)pkt.data[3], (int)pd[4], (int)pd[5],
-(int)pd[6], (int)pd[7], (int)pkt.data[8], (int)pd[9], typ, idc);
-}
-*/
     ret = mux(&pkt, encoder->time_base, octx, ost);
     if (ret < 0) goto encode_cleanup;
     av_packet_unref(&pkt);
@@ -942,33 +972,33 @@ int flush_cuda(struct output_ctx *octx) {
   fprintf(stderr, "%s: %s\n", msg, errstr); \
   return ret; \
 }
-      int ret = 0;
-      while (octx->vc && (!ret || ret == AVERROR(EAGAIN))) {
-        AVFrame *frame = octx->vf.frame;
-        av_frame_unref(frame);
-        ret = av_buffersrc_write_frame(octx->vf.src_ctx, NULL);
-        if (ret < 0) cudaf_err("Error flushing the video filtergraph\n");
-        ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
-        if (ret) frame = NULL;
-        encode(octx->vc, frame, octx, octx->oc->streams[octx->vi], 1);
-        if (frame) av_frame_unref(frame);
-      }
-      ret = 0;
-      while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
-        // XXX check that this actually works
-        AVFrame *frame = octx->af.frame;
-        ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
-        if (ret < 0) cudaf_err("Error flushing the audio filtergraph\n");
-        ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
-        if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai], 0);
-        av_frame_unref(frame);
-      }
-      av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-      ret = av_write_trailer(octx->oc);
-      if (ret < 0) cudaf_err("transcoder: Unable to write trailer");
-      if (!(octx->oc->oformat->flags & AVFMT_NOFILE) && octx->oc->pb) {
-        avio_closep(&octx->oc->pb);
-      }
+  int ret = 0;
+  while (octx->vc && (!ret || ret == AVERROR(EAGAIN))) {
+    AVFrame *frame = octx->vf.frame;
+    av_frame_unref(frame);
+    ret = av_buffersrc_write_frame(octx->vf.src_ctx, NULL);
+    if (ret < 0) cudaf_err("Error flushing the video filtergraph\n");
+    ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
+    if (ret) frame = NULL;
+    encode(octx->vc, frame, octx, octx->oc->streams[octx->vi], 1);
+    if (frame) av_frame_unref(frame);
+  }
+  ret = 0;
+  while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
+    // XXX check that this actually works
+    AVFrame *frame = octx->af.frame;
+    ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
+    if (ret < 0) cudaf_err("Error flushing the audio filtergraph\n");
+    ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
+    if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai], 0);
+    av_frame_unref(frame);
+  }
+  av_interleaved_write_frame(octx->oc, NULL); // flush muxer
+  ret = av_write_trailer(octx->oc);
+  if (ret < 0) cudaf_err("transcoder: Unable to write trailer");
+  if (!(octx->oc->oformat->flags & AVFMT_NOFILE) && octx->oc->pb) {
+    avio_closep(&octx->oc->pb);
+  }
 #undef cudaf_err
 }
 
@@ -1022,8 +1052,11 @@ int transcode(struct transcode_thread *h,
   }
 
   if (!ictx->ic->pb) {
+    fprintf(stderr, "Re-opening input\n");
     ret = avio_open(&ictx->ic->pb, inp->fname, AVIO_FLAG_READ);
     if (ret < 0) main_err("Unable to reopen file");
+    // XXX need to split audio and video:
+    // will need to reopen audio decoder and reuse cuda
     if (AV_HWDEVICE_TYPE_CUDA != ictx->hw_type) ret = open_decoders(inp, ictx);
     if (ret < 0) main_err("Unable to reopen decoders");
   }
@@ -1046,10 +1079,13 @@ int transcode(struct transcode_thread *h,
       if (!h->initialized || AV_HWDEVICE_TYPE_NONE == inp->hw_type) {
         ret = open_output(octx, ictx);
         if (ret < 0) main_err("transcoder: Unable to open output");
+        fprintf(stderr, "Doing full reopen of output incl encoders\n");
         continue;
       }
 
       // reopen output
+fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
+
       AVOutputFormat *fmt = av_guess_format(NULL, octx->fname, NULL);
       if (!fmt) main_err("Unable to guess format for reopen\n");
       ret = avformat_alloc_output_context2(&octx->oc, fmt, NULL, octx->fname);
@@ -1066,7 +1102,7 @@ int transcode(struct transcode_thread *h,
 
         ret = init_video_filters(ictx, octx);
         if (ret < 0) main_err("Unable to open video filter\n")
-      }
+      } else fprintf(stderr, "no video stream\n");
       // re-attach audio encoder
       if (octx->ac) {
         char filter_str[256];
@@ -1109,6 +1145,7 @@ int transcode(struct transcode_thread *h,
     has_frame = lpms_ERR_PACKET_ONLY != ret;
 
     if (AVMEDIA_TYPE_VIDEO == ist->codecpar->codec_type) {
+      if (is_flush_frame(dframe)) goto whileloop_end;
       // width / height will be zero for pure streamcopy (no decoding)
       decoded_results->frames += dframe->width && dframe->height;
       decoded_results->pixels += dframe->width * dframe->height;

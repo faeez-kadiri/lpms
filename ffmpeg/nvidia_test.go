@@ -453,3 +453,40 @@ func TestNvidia_DrainFilters(t *testing.T) {
 	run(cmd)
 
 }
+
+func TestNvidia_CountFrames(t *testing.T) {
+	run, dir := setupTest(t)
+	defer os.RemoveAll(dir)
+
+	cmd := `
+    set -eux
+    cd "$0"
+
+    # run segmenter and sanity check frame counts . Hardcode for now.
+    ffmpeg -loglevel warning -i "$1"/../transcoder/test.ts -c:a copy -c:v copy -f hls test.m3u8
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test0.ts | grep nb_read_frames=120
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test1.ts | grep nb_read_frames=120
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test2.ts | grep nb_read_frames=120
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test3.ts | grep nb_read_frames=120
+  `
+	run(cmd)
+
+	handle := NewTranscoder()
+	//for i := 0; i < 4; i++ {
+	for i := 0; i < 1; i++ {
+		in := &TranscodeOptionsIn{
+			Fname:  fmt.Sprintf("%s/test%d.ts", dir, i),
+			Accel:  Nvidia,
+			Handle: handle,
+			Device: "3",
+		}
+		res, err := Transcode4(in, nil)
+		if err != nil {
+			t.Error(err)
+		}
+		if res.Decoded.Frames != 120 {
+			t.Error(in.Fname, " Mismatched frame count: expected 120 got ", res.Decoded.Frames)
+		}
+	}
+	StopTranscoder(&handle)
+}
