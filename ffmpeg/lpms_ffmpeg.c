@@ -1047,8 +1047,8 @@ int transcode(struct transcode_thread *h,
 
   // Check to see if we can skip decoding
   for (i = 0; i < nb_outputs; i++) {
-    if (!needs_decoder(params[i].video.name)) ictx.dv = ++decode_v == nb_outputs;
-    if (!needs_decoder(params[i].audio.name)) ictx.da = ++decode_a == nb_outputs;
+    if (!needs_decoder(params[i].video.name)) ictx->dv = ++decode_v == nb_outputs;
+    if (!needs_decoder(params[i].audio.name)) ictx->da = ++decode_a == nb_outputs;
   }
 
   if (!ictx->ic->pb) {
@@ -1068,12 +1068,14 @@ int transcode(struct transcode_thread *h,
       octx->fname = params[i].fname;
       octx->width = params[i].w;
       octx->height = params[i].h;
-      octx->vencoder = params[i].vencoder;
+      octx->muxer = &params[i].muxer;
+      octx->audio = &params[i].audio;
+      octx->video = &params[i].video;
       octx->vfilters = params[i].vfilters;
       if (params[i].bitrate) octx->bitrate = params[i].bitrate;
       if (params[i].fps.den) octx->fps = params[i].fps;
-      octx->dv = ictx.vi < 0 || is_drop(octx->video->name);
-      octx->da = ictx.ai < 0 || is_drop(octx->audio->name);
+      octx->dv = ictx->vi < 0 || is_drop(octx->video->name);
+      octx->da = ictx->ai < 0 || is_drop(octx->audio->name);
       octx->res = &results[i];
 
       if (!h->initialized || AV_HWDEVICE_TYPE_NONE == inp->hw_type) {
@@ -1141,7 +1143,7 @@ fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
                             // Bail out on streams that appear to be broken
     else if (lpms_ERR_PACKET_ONLY == ret) ; // keep going for stream copy
     else if (ret < 0) main_err("transcoder: Could not decode; stopping\n");
-    ist = ictx.ic->streams[ipkt.stream_index];
+    ist = ictx->ic->streams[ipkt.stream_index];
     has_frame = lpms_ERR_PACKET_ONLY != ret;
 
     if (AVMEDIA_TYPE_VIDEO == ist->codecpar->codec_type) {
@@ -1149,9 +1151,9 @@ fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
       // width / height will be zero for pure streamcopy (no decoding)
       decoded_results->frames += dframe->width && dframe->height;
       decoded_results->pixels += dframe->width * dframe->height;
-      if (has_frame) ictx.next_pts_v = dframe->pts + dframe->pkt_duration;
+      if (has_frame) ictx->next_pts_v = dframe->pts + dframe->pkt_duration;
     } else if (AVMEDIA_TYPE_AUDIO == ist->codecpar->codec_type) {
-      if (has_frame) ictx.next_pts_a = dframe->pts + dframe->pkt_duration;
+      if (has_frame) ictx->next_pts_a = dframe->pts + dframe->pkt_duration;
     }
 
     for (i = 0; i < nb_outputs; i++) {
@@ -1161,17 +1163,17 @@ fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
       AVCodecContext *encoder = NULL;
       ret = 0; // reset to avoid any carry-through
 
-      if (ist->index == ictx.vi) {
+      if (ist->index == ictx->vi) {
         if (octx->dv) continue; // drop video stream for this output
         ost = octx->oc->streams[0];
-        if (ictx.vc) {
+        if (ictx->vc) {
           encoder = octx->vc;
           filter = &octx->vf;
         }
-      } else if (ist->index == ictx.ai) {
+      } else if (ist->index == ictx->ai) {
         if (octx->da) continue; // drop audio stream for this output
         ost = octx->oc->streams[!octx->dv]; // depends on whether video exists
-        if (ictx.ac) {
+        if (ictx->ac) {
           encoder = octx->ac;
           filter = &octx->af;
         }
@@ -1190,7 +1192,7 @@ fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
         ret = mux(pkt, ist->time_base, octx, ost);
         av_packet_free(&pkt);
       } else if (has_frame) {
-        ret = process_out(&ictx, octx, encoder, ost, filter, dframe);
+        ret = process_out(ictx, octx, encoder, ost, filter, dframe);
       }
       if (AVERROR(EAGAIN) == ret || AVERROR_EOF == ret) continue;
       else if (ret < 0) main_err("transcoder: Error encoding\n");
