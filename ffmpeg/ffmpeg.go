@@ -122,18 +122,18 @@ func configAccel(inAcc, outAcc Acceleration, inDev, outDev string) (string, stri
 			if outDev != "" {
 				upload = upload + "=device=" + outDev
 			}
-			return "h264_nvenc", upload + ",scale_cuda", nil
+			return "h264_nvenc", upload + ",scale_npp", nil
 		}
 	case Nvidia:
 		switch outAcc {
 		case Software:
-			return "libx264", "scale_cuda", nil
+			return "libx264", "scale_npp", nil
 		case Nvidia:
 			// If we encode on a different device from decode then need to transfer
 			if outDev != "" && outDev != inDev {
 				return "", "", ErrTranscoderInp // XXX not allowed
 			}
-			return "h264_nvenc", "scale_cuda", nil
+			return "h264_nvenc", "scale_npp", nil
 		}
 	}
 	return "", "", ErrTranscoderHw
