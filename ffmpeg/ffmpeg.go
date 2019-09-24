@@ -183,15 +183,17 @@ func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 				return nil, err
 			}
 		}
-		encoder, scale_filter := p.VideoEncoder.Name, "scale"
+		//encoder, scale_filter := p.VideoEncoder.Name, "scale"
+		encoder := p.VideoEncoder.Name
 		if encoder == "" {
-			encoder, scale_filter, err = configAccel(input.Accel, p.Accel, input.Device, p.Device)
+			encoder, _ /*scale_filter*/, err = configAccel(input.Accel, p.Accel, input.Device, p.Device)
 			if err != nil {
 				return nil, err
 			}
 		}
 		// preserve aspect ratio along the larger dimension when rescaling
-		filters := fmt.Sprintf("fps=%d/%d,%s='w=if(gte(iw,ih),%d,-2):h=if(lt(iw,ih),%d,-2)'", param.Framerate, 1, scale_filter, w, h)
+		//filters := fmt.Sprintf("fps=%d/%d,%s='w=if(gte(iw,ih),%d,-2):h=if(lt(iw,ih),%d,-2)'", param.Framerate, 1, scale_filter, w, h)
+		filters := fmt.Sprintf("fps=%d/%d", param.Framerate, 1)
 		if input.Accel != Software && p.Accel == Software {
 			// needed for hw dec -> hw rescale -> sw enc
 			filters = filters + ":format=yuv420p,hwdownload"
