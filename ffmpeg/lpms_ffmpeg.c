@@ -33,8 +33,9 @@ struct input_ctx {
 
   int64_t next_pts_a, next_pts_v;
 
-AVPacket *first;
-int flushed;
+  // Decoder flush
+  AVPacket *first;
+  int flushed;
 };
 
 struct filter_ctx {
@@ -243,7 +244,7 @@ static void send_first(struct input_ctx *ictx)
   if (ret < 0) {
     char errstr[AV_ERROR_MAX_STRING_SIZE];
     av_strerror(ret, errstr, sizeof errstr);
-    fprintf(stderr, "error sending packet %d / %s\n", ret, errstr);
+    fprintf(stderr, "Error sending flush packet : %s\n", errstr);
   }
 }
 
@@ -656,7 +657,7 @@ static void free_input(struct input_ctx *inctx)
   if (inctx->hw_device_ctx) av_buffer_unref(&inctx->hw_device_ctx);
 }
 
-int open_decoders(input_params *params, struct input_ctx *ctx)
+static int open_video_decoder(input_params *params, struct input_ctx *ctx)
 {
 #define dd_err(msg) { \
   if (!ret) ret = -1; \
@@ -699,6 +700,25 @@ int open_decoders(input_params *params, struct input_ctx *ctx)
     if (ret < 0) dd_err("Unable to open video decoder\n");
   }
 
+  return 0;
+
+open_decoder_err:
+  free_input(ctx);
+  return ret;
+#undef dd_err
+}
+
+static int open_audio_decoder(input_params *params, struct input_ctx *ctx)
+{
+#define ad_err(msg) { \
+  if (!ret) ret = -1; \
+  fprintf(stderr, msg); \
+  goto open_audio_err; \
+}
+  int ret;
+  AVCodec *codec = NULL;
+  AVFormatContext *ic = ctx->ic;
+
   // open audio decoder
   ctx->ai = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
   if (ctx->da) ; // skip decoding audio
@@ -706,20 +726,20 @@ int open_decoders(input_params *params, struct input_ctx *ctx)
     fprintf(stderr, "No audio stream found in input\n");
   } else {
     AVCodecContext * ac = avcodec_alloc_context3(codec);
-    if (!ac) dd_err("Unable to alloc audio codec\n");
+    if (!ac) ad_err("Unable to alloc audio codec\n");
     ctx->ac = ac;
     ret = avcodec_parameters_to_context(ac, ic->streams[ctx->ai]->codecpar);
-    if (ret < 0) dd_err("Unable to assign audio params\n");
+    if (ret < 0) ad_err("Unable to assign audio params\n");
     ret = avcodec_open2(ac, codec, NULL);
-    if (ret < 0) dd_err("Unable to open audio decoder\n");
+    if (ret < 0) ad_err("Unable to open audio decoder\n");
   }
 
   return 0;
 
-open_decoder_err:
+open_audio_err:
   free_input(ctx);
   return ret;
-#undef dd_err
+#undef ad_err
 }
 
 static int open_input(input_params *params, struct input_ctx *ctx)
@@ -743,12 +763,15 @@ static int open_input(input_params *params, struct input_ctx *ctx)
   ctx->ic = ic;
   ret = avformat_find_stream_info(ic, NULL);
   if (ret < 0) dd_err("Unable to find input info\n");
-  ret = open_decoders(params, ctx);
-  if (ret < 0) dd_err("Unable to open decoder")
+  ret = open_video_decoder(params, ctx);
+  if (ret < 0) dd_err("Unable to open video decoder\n")
+  ret = open_audio_decoder(params, ctx);
+  if (ret < 0) dd_err("Unable to open audio decoder\n")
 
   return 0;
 
 open_input_err:
+fprintf(stderr, "Freeing input based on OPEN INPUT error\n");
   free_input(ctx);
   return ret;
 #undef dd_err
@@ -777,7 +800,7 @@ int process_in(struct input_ctx *ictx, AVFrame *frame, AVPacket *pkt)
     else if (pkt->stream_index == ictx->vi || pkt->stream_index == ictx->ai) break;
     else dec_err("Could not find decoder or stream\n");
 
-    if (!ictx->first && pkt->flags & AV_PKT_FLAG_KEY) {
+    if (!ictx->first && pkt->flags & AV_PKT_FLAG_KEY && decoder == ictx->vc) {
       ictx->first = av_packet_clone(pkt);
       ictx->first->pts = -1;
     }
@@ -803,7 +826,7 @@ dec_flush:
   // Flush and close decoder for non-CUDA
 
   if (ictx->vc) {
-send_first(ictx);
+    send_first(ictx);
 
     //avcodec_send_packet(ictx->vc, NULL); // XXX fix
     ret = avcodec_receive_frame(ictx->vc, frame);
@@ -814,7 +837,6 @@ send_first(ictx);
     }
   }
   if (ictx->ac) {
-fprintf(stderr, "got audio?\n");
     avcodec_send_packet(ictx->ac, NULL); // XXX fix
     ret = avcodec_receive_frame(ictx->ac, frame);
     pkt->stream_index = ictx->ai; // XXX ugly?
@@ -1055,10 +1077,13 @@ int transcode(struct transcode_thread *h,
     fprintf(stderr, "Re-opening input\n");
     ret = avio_open(&ictx->ic->pb, inp->fname, AVIO_FLAG_READ);
     if (ret < 0) main_err("Unable to reopen file");
-    // XXX need to split audio and video:
-    // will need to reopen audio decoder and reuse cuda
-    if (AV_HWDEVICE_TYPE_CUDA != ictx->hw_type) ret = open_decoders(inp, ictx);
-    if (ret < 0) main_err("Unable to reopen decoders");
+    // XXX check to see if we can also reuse decoder for sw decoding
+    if (AV_HWDEVICE_TYPE_CUDA != ictx->hw_type) {
+      ret = open_video_decoder(inp, ictx);
+      if (ret < 0) main_err("Unable to reopen video decoder");
+    }
+    ret = open_audio_decoder(inp, ictx);
+    if (ret < 0) main_err("Unable to reopen audio decoder")
   }
 
   // populate output contexts
@@ -1210,6 +1235,8 @@ whileloop_end:
 transcode_cleanup:
   avio_closep(&ictx->ic->pb);
   if (dframe) av_frame_free(&dframe);
+  ictx->flushed = 0;
+  if (ictx->first) av_packet_free(&ictx->first);
   return ret == AVERROR_EOF ? 0 : ret;
 #undef main_err
 }

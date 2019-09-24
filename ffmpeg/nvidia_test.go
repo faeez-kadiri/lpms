@@ -472,8 +472,9 @@ func TestNvidia_CountFrames(t *testing.T) {
 	run(cmd)
 
 	handle := NewTranscoder()
-	//for i := 0; i < 4; i++ {
-	for i := 0; i < 1; i++ {
+
+	// Test decoding
+	for i := 0; i < 4; i++ {
 		in := &TranscodeOptionsIn{
 			Fname:  fmt.Sprintf("%s/test%d.ts", dir, i),
 			Accel:  Nvidia,
