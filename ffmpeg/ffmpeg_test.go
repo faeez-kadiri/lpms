@@ -1358,3 +1358,17 @@ func TestTranscoder_Stopped(t *testing.T) {
 		t.Errorf("Unexpected error; wanted %v but got %v", ErrTranscoderStp, err)
 	}
 }
+
+func TestTranscoder_TooManyOutputs(t *testing.T) {
+
+	out := make([]TranscodeOptions, 11)
+	for i, _ := range out {
+		out[i].VideoEncoder = ComponentOptions{Name: "drop"}
+	}
+	in := &TranscodeOptionsIn{}
+	tc := NewTranscoder()
+	_, err := tc.Transcode(in, out)
+	if err == nil || err.Error() != "Too many outputs" {
+		t.Error("Expected 'Too many outputs', got ", err)
+	}
+}

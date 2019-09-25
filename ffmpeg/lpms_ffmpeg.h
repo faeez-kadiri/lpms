@@ -7,6 +7,7 @@
 // LPMS specific errors
 extern const int lpms_ERR_INPUT_PIXFMT;
 extern const int lpms_ERR_FILTERS;
+extern const int lpms_ERR_OUTPUTS;
 
 struct transcode_thread;
 

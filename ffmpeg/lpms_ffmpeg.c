@@ -15,6 +15,7 @@
 const int lpms_ERR_INPUT_PIXFMT = FFERRTAG('I','N','P','X');
 const int lpms_ERR_FILTERS = FFERRTAG('F','L','T','R');
 const int lpms_ERR_PACKET_ONLY = FFERRTAG('P','K','O','N');
+const int lpms_ERR_OUTPUTS = FFERRTAG('O','U','T','P');
 
 //
 // Internal transcoder data structures
@@ -1060,7 +1061,6 @@ int transcode(struct transcode_thread *h,
   goto transcode_cleanup; \
 }
   int ret = 0, i = 0;
-  int decode_a = 0, decode_v = 0;
   struct input_ctx *ictx = &h->ictx;
   struct output_ctx *outputs = h->outputs;
   int nb_outputs = h->nb_outputs;
@@ -1068,13 +1068,6 @@ int transcode(struct transcode_thread *h,
   AVFrame *dframe = NULL;
 
   if (!inp) main_err("transcoder: Missing input params\n")
-  if (nb_outputs > MAX_OUTPUT_SIZE) main_err("transcoder: Too many outputs\n");
-
-  // Check to see if we can skip decoding
-  for (i = 0; i < nb_outputs; i++) {
-    if (!needs_decoder(params[i].video.name)) ictx->dv = ++decode_v == nb_outputs;
-    if (!needs_decoder(params[i].audio.name)) ictx->da = ++decode_a == nb_outputs;
-  }
 
   if (!ictx->ic->pb) {
     fprintf(stderr, "Re-opening input\n");
@@ -1262,7 +1255,17 @@ int lpms_transcode(input_params *inp, output_params *params,
 
   pthread_mutex_lock(&h->mu);
   if (!h->initialized) {
+    int i = 0;
+    int decode_a = 0, decode_v = 0;
+
     fprintf(stderr, "Initializing new transcode thread\n");
+    if (nb_outputs > MAX_OUTPUT_SIZE) return lpms_ERR_OUTPUTS;
+
+    // Check to see if we can skip decoding
+    for (i = 0; i < nb_outputs; i++) {
+      if (!needs_decoder(params[i].video.name)) h->ictx.dv = ++decode_v == nb_outputs;
+      if (!needs_decoder(params[i].audio.name)) h->ictx.da = ++decode_a == nb_outputs;
+    }
 
     h->nb_outputs = nb_outputs;
 
