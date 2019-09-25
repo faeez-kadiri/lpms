@@ -19,6 +19,7 @@ import "C"
 var ErrTranscoderRes = errors.New("TranscoderInvalidResolution")
 var ErrTranscoderHw = errors.New("TranscoderInvalidHardware")
 var ErrTranscoderInp = errors.New("TranscoderInvalidInput")
+var ErrTranscoderStp = errors.New("TranscoderStopped")
 
 type Acceleration int
 
@@ -33,13 +34,15 @@ type ComponentOptions struct {
 	Opts map[string]string
 }
 
-type TranscoderHandle *C.struct_transcode_thread
+type Transcoder struct {
+	handle  *C.struct_transcode_thread
+	stopped bool
+}
 
 type TranscodeOptionsIn struct {
 	Fname  string
 	Accel  Acceleration
 	Device string
-	Handle TranscoderHandle
 }
 
 type TranscodeOptions struct {
@@ -59,7 +62,6 @@ type MediaInfo struct {
 }
 
 type TranscodeResults struct {
-	Handle  TranscoderHandle
 	Decoded MediaInfo
 	Encoded []MediaInfo
 }
@@ -159,13 +161,15 @@ func Transcode2(input *TranscodeOptionsIn, ps []TranscodeOptions) error {
 }
 
 func Transcode3(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeResults, error) {
-	handle := NewTranscoder()
-	defer StopTranscoder(&handle)
-	input.Handle = handle
-	return Transcode4(input, ps)
+	t := NewTranscoder()
+	defer t.StopTranscoder()
+	return t.Transcode(input, ps)
 }
 
-func Transcode4(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeResults, error) {
+func (t *Transcoder) Transcode(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeResults, error) {
+	if t.stopped || t.handle == nil {
+		return nil, ErrTranscoderStp
+	}
 	if input == nil {
 		return nil, ErrTranscoderInp
 	}
@@ -241,7 +245,7 @@ func Transcode4(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 		defer C.free(unsafe.Pointer(device))
 	}
 	inp := &C.input_params{fname: fname, hw_type: hw_type, device: device,
-		handle: input.Handle}
+		handle: t.handle}
 	results := make([]C.output_results, len(ps))
 	decoded := &C.output_results{}
 	var (
@@ -268,16 +272,22 @@ func Transcode4(input *TranscodeOptionsIn, ps []TranscodeOptions) (*TranscodeRes
 		Frames: int(decoded.frames),
 		Pixels: int64(decoded.pixels),
 	}
-	return &TranscodeResults{Handle: inp.handle, Encoded: tr, Decoded: dec}, nil
+	return &TranscodeResults{Encoded: tr, Decoded: dec}, nil
 }
 
-func NewTranscoder() TranscoderHandle {
-	return C.lpms_transcode_new()
+func NewTranscoder() *Transcoder {
+	return &Transcoder{
+		handle: C.lpms_transcode_new(),
+	}
 }
 
-func StopTranscoder(handle *TranscoderHandle) {
-	C.lpms_transcode_stop(*handle)
-	handle = nil // do this here bc double pointer params are hard in cgo
+func (t *Transcoder) StopTranscoder() {
+	if t.stopped {
+		return
+	}
+	C.lpms_transcode_stop(t.handle)
+	t.handle = nil // prevent accidental reuse
+	t.stopped = true
 }
 
 func InitFFmpeg() {

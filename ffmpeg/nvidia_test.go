@@ -471,17 +471,16 @@ func TestNvidia_CountFrames(t *testing.T) {
   `
 	run(cmd)
 
-	handle := NewTranscoder()
+	tc := NewTranscoder()
 
 	// Test decoding
 	for i := 0; i < 4; i++ {
 		in := &TranscodeOptionsIn{
 			Fname:  fmt.Sprintf("%s/test%d.ts", dir, i),
 			Accel:  Nvidia,
-			Handle: handle,
 			Device: "3",
 		}
-		res, err := Transcode4(in, nil)
+		res, err := tc.Transcode(in, nil)
 		if err != nil {
 			t.Error(err)
 		}
@@ -489,5 +488,5 @@ func TestNvidia_CountFrames(t *testing.T) {
 			t.Error(in.Fname, " Mismatched frame count: expected 120 got ", res.Decoded.Frames)
 		}
 	}
-	StopTranscoder(&handle)
+	tc.StopTranscoder()
 }

@@ -1338,3 +1338,23 @@ nb_read_frames=%d
 	}
 	checkStatsFile(in, &out[0], res)
 }
+
+func TestTranscoder_Stopped(t *testing.T) {
+
+	// Test stopped transcoder
+	tc := NewTranscoder()
+	tc.StopTranscoder()
+	in := &TranscodeOptionsIn{}
+	_, err := tc.Transcode(in, nil)
+	if err != ErrTranscoderStp {
+		t.Errorf("Unexpected error; wanted %v but got %v", ErrTranscoderStp, err)
+	}
+
+	// test somehow munged transcoder handle
+	tc2 := NewTranscoder()
+	tc2.handle = nil // technically this leaks memory ... OK for test
+	_, err = tc2.Transcode(in, nil)
+	if err != ErrTranscoderStp {
+		t.Errorf("Unexpected error; wanted %v but got %v", ErrTranscoderStp, err)
+	}
+}
