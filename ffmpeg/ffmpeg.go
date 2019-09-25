@@ -209,7 +209,7 @@ func (t *Transcoder) Transcode(input *TranscodeOptionsIn, ps []TranscodeOptions)
 		filters := fmt.Sprintf("fps=%d/%d,%s='w=if(gte(iw,ih),%d,-2):h=if(lt(iw,ih),%d,-2)'", param.Framerate, 1, scale_filter, w, h)
 		if input.Accel != Software && p.Accel == Software {
 			// needed for hw dec -> hw rescale -> sw enc
-			filters = filters + ":format=yuv420p,hwdownload"
+			filters = filters + ",hwdownload,format=nv12"
 		}
 		muxOpts := C.component_opts{
 			opts: newAVOpts(p.Muxer.Opts), // don't free this bc of avformat_write_header API
