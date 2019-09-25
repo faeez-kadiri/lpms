@@ -490,3 +490,61 @@ func TestNvidia_CountFrames(t *testing.T) {
 	}
 	tc.StopTranscoder()
 }
+
+func TestNvidia_CountEncodedFrames(t *testing.T) {
+	run, dir := setupTest(t)
+	defer os.RemoveAll(dir)
+
+	cmd := `
+    # run segmenter and sanity check frame counts . Hardcode for now.
+    ffmpeg -loglevel warning -i "$1"/../transcoder/test.ts -c:a copy -c:v copy -f hls test.m3u8
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test0.ts | grep nb_read_frames=120
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test1.ts | grep nb_read_frames=120
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test2.ts | grep nb_read_frames=120
+    ffprobe -loglevel warning -select_streams v -count_frames -show_streams test3.ts | grep nb_read_frames=120
+  `
+	run(cmd)
+
+	tc := NewTranscoder()
+
+	// Test decoding
+	for i := 0; i < 4; i++ {
+		in := &TranscodeOptionsIn{
+			Fname:  fmt.Sprintf("%s/test%d.ts", dir, i),
+			Accel:  Nvidia,
+			Device: "3",
+		}
+		p60fps := P144p30fps16x9
+		p60fps.Framerate = 60
+		p120fps := P144p30fps16x9
+		p120fps.Framerate = 120
+		out := []TranscodeOptions{TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/out_30fps_%d.ts", dir, i),
+			Profile: P144p30fps16x9,
+			Accel:   Nvidia,
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/out_60fps_%d.ts", dir, i),
+			Profile: p60fps,
+			Accel:   Nvidia,
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/out_120fps_%d.ts", dir, i),
+			Profile: p120fps,
+			Accel:   Nvidia,
+		}}
+
+		res, err := tc.Transcode(in, out)
+		if err != nil {
+			t.Error(err)
+		}
+		if res.Encoded[0].Frames != 60 {
+			t.Error(in.Fname, " Mismatched frame count: expected 60 got ", res.Encoded[0].Frames)
+		}
+		if res.Encoded[1].Frames != 120 {
+			t.Error(in.Fname, " Mismatched frame count: expected 120 got ", res.Encoded[1].Frames)
+		}
+		if res.Encoded[2].Frames != 240 {
+			t.Error(in.Fname, " Mismatched frame count: expected 240 got ", res.Encoded[2].Frames)
+		}
+	}
+	tc.StopTranscoder()
+}
