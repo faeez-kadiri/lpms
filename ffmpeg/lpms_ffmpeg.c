@@ -1259,7 +1259,10 @@ int lpms_transcode(input_params *inp, output_params *params,
     int decode_a = 0, decode_v = 0;
 
     fprintf(stderr, "Initializing new transcode thread\n");
-    if (nb_outputs > MAX_OUTPUT_SIZE) return lpms_ERR_OUTPUTS;
+    if (nb_outputs > MAX_OUTPUT_SIZE) {
+      pthread_mutex_unlock(&h->mu);
+      return lpms_ERR_OUTPUTS;
+    }
 
     // Check to see if we can skip decoding
     for (i = 0; i < nb_outputs; i++) {
@@ -1271,7 +1274,10 @@ int lpms_transcode(input_params *inp, output_params *params,
 
     // populate input context
     ret = open_input(inp, &h->ictx);
-    if (ret < 0) return ret;
+    if (ret < 0) {
+      pthread_mutex_unlock(&h->mu);
+      return ret;
+    }
 
     fprintf(stderr, "transcode thread ready\n");
   }
