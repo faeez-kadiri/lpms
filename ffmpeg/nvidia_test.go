@@ -548,3 +548,36 @@ func TestNvidia_CountEncodedFrames(t *testing.T) {
 	}
 	tc.StopTranscoder()
 }
+
+func TestNvidia_RepeatedSpecialOpts(t *testing.T) {
+
+	_, dir := setupTest(t)
+
+	err := RTMPToHLS("../transcoder/test.ts", dir+"/out.m3u8", dir+"/out_%d.ts", "2", 0)
+	if err != nil {
+		t.Error(err)
+	}
+
+	//run("ls -lha && exit 1")
+
+	// At some point we forgot to set the muxer type in reopened outputs
+	// This used to cause an error, so just check that it's resolved
+	in := &TranscodeOptionsIn{Accel: Nvidia}
+	out := []TranscodeOptions{TranscodeOptions{
+		Oname:        "-",
+		Profile:      P144p30fps16x9,
+		VideoEncoder: ComponentOptions{Opts: map[string]string{"zerolatency": "1"}},
+		Muxer:        ComponentOptions{Name: "null"},
+		Accel:        Nvidia}}
+	tc := NewTranscoder()
+	for i := 0; i < 4; i++ {
+		in.Fname = fmt.Sprintf("%s/out_%d.ts", dir, i)
+		_, err := tc.Transcode(in, out)
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	tc.StopTranscoder()
+
+	// ALso test when a repeated option fails ?? Special behaviour for this?
+}

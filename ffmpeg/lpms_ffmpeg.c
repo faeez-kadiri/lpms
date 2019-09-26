@@ -1109,7 +1109,7 @@ int transcode(struct transcode_thread *h,
       // reopen output
 fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
 
-      AVOutputFormat *fmt = av_guess_format(NULL, octx->fname, NULL);
+      AVOutputFormat *fmt = av_guess_format(octx->muxer->name, octx->fname, NULL);
       if (!fmt) main_err("Unable to guess format for reopen\n");
       ret = avformat_alloc_output_context2(&octx->oc, fmt, NULL, octx->fname);
       if (ret < 0) main_err("Unable to alloc reopened out context\n");
