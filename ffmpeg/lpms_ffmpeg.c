@@ -503,6 +503,80 @@ init_audio_filters_cleanup:
 }
 
 
+static int add_video_stream(struct output_ctx *octx, struct input_ctx *ictx)
+{
+#define vs_err(msg) { \
+  if (!ret) ret = -1; \
+  fprintf(stderr, "Error adding video stream: " msg); \
+  goto add_video_err; \
+}
+
+  // video stream to muxer
+  int ret = 0;
+  AVStream *st = avformat_new_stream(octx->oc, NULL);
+  if (!st) vs_err("Unable to alloc video stream\n");
+  octx->vi = st->index;
+  st->avg_frame_rate = octx->fps;
+  if (is_copy(octx->video->name)) {
+    AVStream *ist = ictx->ic->streams[ictx->vi];
+    if (ictx->vi < 0 || !ist) vs_err("Input video stream does not exist\n");
+    st->time_base = ist->time_base;
+    ret = avcodec_parameters_copy(st->codecpar, ist->codecpar);
+    if (ret < 0) vs_err("Error copying video params from input stream\n");
+    // Sometimes the codec tag is wonky for some reason, so correct it
+    ret = av_codec_get_tag2(octx->oc->oformat->codec_tag, st->codecpar->codec_id, &st->codecpar->codec_tag);
+    avformat_transfer_internal_stream_timing_info(octx->oc->oformat, st, ist, AVFMT_TBCF_DEMUXER);
+  } else if (octx->vc) {
+    st->time_base = octx->vc->time_base;
+    ret = avcodec_parameters_from_context(st->codecpar, octx->vc);
+    if (ret < 0) vs_err("Error setting video params from encoder\n");
+  } else vs_err("No video encoder, not a copy; what is this?\n");
+  return 0;
+
+add_video_err:
+  // XXX free anything here?
+  return ret;
+#undef vs_err
+}
+
+static int add_audio_stream(struct output_ctx *octx, struct input_ctx *ictx)
+{
+#define as_err(msg) { \
+  if (!ret) ret = -1; \
+  fprintf(stderr, "Error adding audio stream: " msg); \
+  goto add_audio_err; \
+}
+
+  // audio stream to muxer
+  int ret = 0;
+  AVStream *st = avformat_new_stream(octx->oc, NULL);
+  if (!st) as_err("Unable to alloc audio stream\n");
+  if (is_copy(octx->audio->name)) {
+    AVStream *ist = ictx->ic->streams[ictx->ai];
+    if (ictx->ai < 0 || !ist) as_err("Input audio stream does not exist\n");
+    st->time_base = ist->time_base;
+    ret = avcodec_parameters_copy(st->codecpar, ist->codecpar);
+    if (ret < 0) as_err("Error copying audio params from input stream\n");
+    // Sometimes the codec tag is wonky for some reason, so correct it
+    ret = av_codec_get_tag2(octx->oc->oformat->codec_tag, st->codecpar->codec_id, &st->codecpar->codec_tag);
+    avformat_transfer_internal_stream_timing_info(octx->oc->oformat, st, ist, AVFMT_TBCF_DEMUXER);
+  } else if (octx->ac) {
+    st->time_base = octx->ac->time_base;
+    ret = avcodec_parameters_from_context(st->codecpar, octx->ac);
+    if (ret < 0) as_err("Error setting audio params from encoder\n");
+  } else as_err("No audio encoder; not a copy; what is this?\n");
+  octx->ai = st->index;
+
+  // signal whether to drop preroll audio
+  if (st->codecpar->initial_padding) octx->drop_ts = AV_NOPTS_VALUE;
+  return 0;
+
+add_audio_err:
+  // XXX free anything here?
+  return ret;
+#undef as_err
+}
+
 static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
 {
 #define em_err(msg) { \
@@ -565,25 +639,8 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
   // add video stream if input contains video
   inp_has_stream = ictx->vi >= 0;
   if (inp_has_stream && !octx->dv) {
-    // video stream in muxer
-    st = avformat_new_stream(oc, NULL);
-    if (!st) em_err("Unable to alloc video stream\n");
-    octx->vi = st->index;
-    st->avg_frame_rate = octx->fps;
-    if (is_copy(octx->video->name)) {
-      AVStream *ist = ictx->ic->streams[ictx->vi];
-      st->time_base = ist->time_base;
-      ret = avcodec_parameters_copy(st->codecpar, ist->codecpar);
-      if (ret < 0) em_err("Error copying video params from input stream\n");
-      // Sometimes the codec tag is wonky for some reason, so correct it
-      ret = av_codec_get_tag2(fmt->codec_tag, st->codecpar->codec_id, &st->codecpar->codec_tag);
-      //if (!ret) fprintf(stderr, "Video codec tag not found. Continuing anyway\n");
-      avformat_transfer_internal_stream_timing_info(fmt, st, ist, AVFMT_TBCF_DEMUXER);
-    } else if (vc) {
-      st->time_base = vc->time_base;
-      ret = avcodec_parameters_from_context(st->codecpar, vc);
-      if (ret < 0) em_err("Error setting video params from encoder\n");
-    } else em_err("No video encoder, not a copy; what is this?\n");
+    ret = add_video_stream(octx, ictx);
+    if (ret < 0) em_err("Error adding video stream\n");
   }
 
   // add audio encoder if a decoder exists and this output requires one
@@ -615,27 +672,8 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
   // add audio stream if input contains audio
   inp_has_stream = ictx->ai >= 0;
   if (inp_has_stream && !octx->da) {
-    // audio stream in muxer
-    st = avformat_new_stream(oc, NULL);
-    if (!st) em_err("Unable to alloc audio stream\n");
-    if (is_copy(octx->audio->name)) {
-      AVStream *ist = ictx->ic->streams[ictx->ai];
-      st->time_base = ist->time_base;
-      ret = avcodec_parameters_copy(st->codecpar, ist->codecpar);
-      if (ret < 0) em_err("Error copying audio params from input stream\n");
-      // Sometimes the codec tag is wonky for some reason, so correct it
-      ret = av_codec_get_tag2(fmt->codec_tag, st->codecpar->codec_id, &st->codecpar->codec_tag);
-      //if (!ret) fprintf(stderr, "Audio codec tag not found. Continuing anyway\n");
-      avformat_transfer_internal_stream_timing_info(fmt, st, ist, AVFMT_TBCF_DEMUXER);
-    } else if (ac) {
-      st->time_base = ac->time_base;
-      ret = avcodec_parameters_from_context(st->codecpar, ac);
-      if (ret < 0) em_err("Error setting audio params from encoder\n");
-    } else em_err("No audio encoder; not a copy; what is this?\n");
-    octx->ai = st->index;
-
-    // signal whether to drop preroll audio
-    if (st->codecpar->initial_padding) octx->drop_ts = AV_NOPTS_VALUE;
+    ret = add_audio_stream(octx, ictx);
+    if (ret < 0) em_err("Error adding audio stream\n");
   }
 
   if (!(fmt->flags & AVFMT_NOFILE)) {
@@ -1117,30 +1155,16 @@ fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
       if (ret < 0) main_err("Unable to alloc reopened out context\n");
       // re-attach video encoder
       if (octx->vc) {
-        AVStream *st = avformat_new_stream(octx->oc, NULL);
-        if (!st) main_err("Unable to re-alloc video stream\n");
-        st->avg_frame_rate = octx->fps;
-        st->time_base = octx->vc->time_base;
-        ret = avcodec_parameters_from_context(st->codecpar, octx->vc);
-        if (ret < 0) main_err("Unable to re-set video stream params\n");
-        octx->vi = st->index;
-
+        ret = add_video_stream(octx, ictx);
+        if (ret < 0) main_err("Unable to re-add video stream\n");
         ret = init_video_filters(ictx, octx);
-        if (ret < 0) main_err("Unable to open video filter\n")
+        if (ret < 0) main_err("Unable to re-open video filter\n")
       } else fprintf(stderr, "no video stream\n");
       // re-attach audio encoder
       if (octx->ac) {
         char filter_str[256];
-        AVStream *st = avformat_new_stream(octx->oc, NULL);
-        if (!st) main_err("Unable to re-alloc audio stream\n");
-        ret = avcodec_parameters_from_context(st->codecpar, octx->ac);
-        st->time_base = octx->ac->time_base;
-        if (ret < 0) main_err("Unable to re-copy audio stream params\n");
-        octx->ai = st->index;
-
-        // signal whether to drop preroll audio (???)
-        //if (st->codecpar->initial_padding) octx->drop_ts = AV_NOPTS_VALUE;
-
+        ret = add_audio_stream(octx, ictx);
+        if (ret < 0) main_err("Unable to re-add audio stream\n");
         snprintf(filter_str, sizeof filter_str, "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100"); // set sample format and rate based on encoder support
         ret = init_audio_filters(ictx, octx, filter_str);
         if (ret < 0) main_err("Unable to open audio filter\n")
