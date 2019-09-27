@@ -581,3 +581,79 @@ func TestNvidia_RepeatedSpecialOpts(t *testing.T) {
 
 	// ALso test when a repeated option fails ?? Special behaviour for this?
 }
+
+func TestNvidia_API_MixedOutput(t *testing.T) {
+	run, dir := setupTest(t)
+	err := RTMPToHLS("../transcoder/test.ts", dir+"/out.m3u8", dir+"/out_%d.ts", "2", 0)
+	if err != nil {
+		t.Error(err)
+	}
+
+	profile := P144p30fps16x9
+	profile.Framerate = 123
+	tc := NewTranscoder()
+	for i := 0; i < 4; i++ {
+		in := &TranscodeOptionsIn{Fname: fmt.Sprintf("%s/out_%d.ts", dir, i)}
+		out := []TranscodeOptions{TranscodeOptions{
+			Oname:        fmt.Sprintf("%s/%d.md5", dir, i),
+			AudioEncoder: ComponentOptions{Name: "drop"},
+			VideoEncoder: ComponentOptions{Name: "copy"},
+			Muxer:        ComponentOptions{Name: "md5"},
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/nv_%d.ts", dir, i),
+			Profile: profile,
+			Accel:   Nvidia,
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/sw_%d.ts", dir, i),
+			Profile: profile,
+		}}
+		res, err := tc.Transcode(in, out)
+		if err != nil {
+			t.Error(err)
+		}
+		if res.Decoded.Frames != 120 {
+			t.Error("Did not get decoded frames", res.Decoded.Frames)
+		}
+		if res.Encoded[1].Frames != res.Encoded[2].Frames {
+			t.Error("Mismatched frame count for hw/nv")
+		}
+	}
+	cmd := `
+    function check {
+
+      # Check md5sum for stream copy / drop
+      ffmpeg -loglevel warning -i out_$1.ts -an -c:v copy -f md5 ffmpeg_$1.md5
+      diff -u $1.md5 ffmpeg_$1.md5
+
+      ffmpeg -loglevel warning -i out_$1.ts -c:a aac -ar 44100 -ac 2 \
+        -vf hwupload_cuda,fps=123,scale_cuda=w=256:h=144 -c:v h264_nvenc \
+        ffmpeg_nv_$1.ts
+
+      # sanity check ffmpeg frame count against ours
+      ffprobe -count_frames -show_streams -select_streams v ffmpeg_nv_$1.ts | grep nb_read_frames=246
+      ffprobe -count_frames -show_streams -select_streams v nv_$1.ts | grep nb_read_frames=246
+      ffprobe -count_frames -show_streams -select_streams v sw_$1.ts | grep nb_read_frames=246
+
+    # check image quality
+    ffmpeg -loglevel warning -i nv_$1.ts -i ffmpeg_nv_$1.ts \
+      -lavfi '[0:v][1:v]ssim=nv_stats_$1.log' -f null -
+    grep -Po 'All:\K\d+.\d+' nv_stats_$1.log | \
+      awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
+
+    ffmpeg -loglevel warning -i sw_$1.ts -i ffmpeg_nv_$1.ts \
+      -lavfi '[0:v][1:v]ssim=sw_stats_$1.log' -f null -
+    grep -Po 'All:\K\d+.\d+' sw_stats_$1.log | \
+      awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
+
+
+    }
+
+
+    check 0
+    check 1
+    check 2
+    check 3
+  `
+	run(cmd)
+	tc.StopTranscoder()
+}

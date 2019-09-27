@@ -1100,7 +1100,8 @@ int transcode(struct transcode_thread *h,
       octx->da = ictx->ai < 0 || is_drop(octx->audio->name);
       octx->res = &results[i];
 
-      if (!h->initialized || AV_HWDEVICE_TYPE_NONE == inp->hw_type) {
+      // XXX valgrind this line up
+      if (!h->initialized || AV_HWDEVICE_TYPE_NONE == octx->hw_type) {
         ret = open_output(octx, ictx);
         if (ret < 0) main_err("transcoder: Unable to open output");
         fprintf(stderr, "Doing full reopen of output incl encoders\n");
