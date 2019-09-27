@@ -61,6 +61,9 @@ struct output_ctx {
   int dv, da; // flags whether to drop video or audio
   struct filter_ctx vf, af;
 
+  // Optional hardware encoding support
+  enum AVHWDeviceType hw_type;
+
   // muxer and encoder information (name + options)
   component_opts *muxer;
   component_opts *video;
@@ -556,6 +559,7 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     av_dict_free(&octx->video->opts); // avcodec_open2 replaces this
     if (ret < 0) em_err("Error opening video encoder\n");
 }
+    octx->hw_type = ictx->hw_type;
   }
 
   // add video stream if input contains video
@@ -869,8 +873,7 @@ static int mux(AVPacket *pkt, AVRational tb, struct output_ctx *octx, AVStream *
   return av_interleaved_write_frame(octx->oc, pkt);
 }
 
-int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx,
-AVStream* ost, int flush) {
+int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx, AVStream* ost) {
 #define encode_err(msg) { \
   char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
   if (!ret) { fprintf(stderr, "should not happen\n"); ret = AVERROR(ENOMEM); } \
@@ -893,16 +896,18 @@ AVStream* ost, int flush) {
 
 int ret = 0;
 
-  if (!flush || frame) {
+  // We don't want to send NULL frames for HW encoding
+  // because that closes the encoder: not something we want
+  if (AV_HWDEVICE_TYPE_NONE == octx->hw_type || frame) {
     ret = avcodec_send_frame(encoder, frame);
     if (AVERROR_EOF == ret) ; // continue ; drain encoder
     else if (ret < 0) encode_err("Error sending frame to encoder");
   }
 
-  if (flush && AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type)  {
+  //if (flush && AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type)  {
     //fprintf(stderr, "Flushing\n");
-    if (!strcmp("nvenc", encoder->codec->wrapper_name)) av_nvenc_flush(encoder);
-  }
+    //if (!strcmp("nvenc", encoder->codec->wrapper_name)) av_nvenc_flush(encoder);
+  //}
 
   while (1) {
     av_init_packet(&pkt);
@@ -915,10 +920,6 @@ int ret = 0;
   }
 
 encode_cleanup:
-  if (flush && AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type)  {
-    octx->nb_frame = 0;
-    //fprintf(stderr, "Completed flush\n");
-  }
   av_packet_unref(&pkt);
   return ret;
 
@@ -941,7 +942,7 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
 
   if (!filter || !filter->active) {
     // No filter in between decoder and encoder, so use input frame directly
-    return encode(encoder, inf, octx, ost, 0);
+    return encode(encoder, inf, octx, ost);
   }
 
   // Sometimes we have to reset the filter if the HW context is updated
@@ -979,7 +980,7 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
       if (inf) return ret;
       frame = NULL;
     } else if (ret < 0) proc_err("Error consuming the filtergraph\n");
-    ret = encode(encoder, frame, octx, ost, 0);
+    ret = encode(encoder, frame, octx, ost);
     av_frame_unref(frame);
     if (frame == NULL) return ret;
   }
@@ -1006,7 +1007,7 @@ static int flush_cuda(struct input_ctx *ictx, struct output_ctx *octx) {
     av_frame_unref(frame);
     ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
     if (ret) frame = NULL;
-    encode(octx->vc, frame, octx, octx->oc->streams[octx->vi], 1);
+    encode(octx->vc, frame, octx, octx->oc->streams[octx->vi]);
     if (frame) av_frame_unref(frame);
   }
   while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
@@ -1015,7 +1016,7 @@ static int flush_cuda(struct input_ctx *ictx, struct output_ctx *octx) {
     ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
     if (ret < 0) cudaf_err("Error flushing the audio filtergraph\n");
     ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
-    if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai], 0);
+    if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai]);
     av_frame_unref(frame);
   }
   av_interleaved_write_frame(octx->oc, NULL); // flush muxer
@@ -1236,6 +1237,7 @@ whileloop_end:
     if (AV_HWDEVICE_TYPE_CUDA == ictx->hw_type) ret = flush_cuda(ictx, &outputs[i]);
     else ret = flush_outputs(ictx, &outputs[i]);
     if (ret < 0) main_err("transcoder: Unable to fully flush outputs")
+    outputs[i].nb_frame = 0;
   }
 
 transcode_cleanup:
