@@ -591,7 +591,6 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
   AVCodecContext *vc  = NULL;
   AVCodecContext *ac  = NULL;
   AVCodec *codec      = NULL;
-  AVStream *st        = NULL;
 
   // open muxer
   fmt = av_guess_format(octx->muxer->name, octx->fname, NULL);
@@ -707,7 +706,7 @@ static int open_video_decoder(input_params *params, struct input_ctx *ctx)
   fprintf(stderr, msg); \
   goto open_decoder_err; \
 }
-  int ret;
+  int ret = 0;
   AVCodec *codec = NULL;
   AVFormatContext *ic = ctx->ic;
 
@@ -758,7 +757,7 @@ static int open_audio_decoder(input_params *params, struct input_ctx *ctx)
   fprintf(stderr, msg); \
   goto open_audio_err; \
 }
-  int ret;
+  int ret = 0;
   AVCodec *codec = NULL;
   AVFormatContext *ic = ctx->ic;
 
@@ -794,7 +793,7 @@ static int open_input(input_params *params, struct input_ctx *ctx)
 }
   AVFormatContext *ic   = NULL;
   char *inp = params->fname;
-  int ret;
+  int ret = 0;
 
   // open demuxer
   ic = avformat_alloc_context();
@@ -920,6 +919,7 @@ int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx, AVS
   goto encode_cleanup; \
 }
 
+  int ret = 0;
   AVPacket pkt = {0};
 
   if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type && frame) {
@@ -932,7 +932,6 @@ int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx, AVS
     octx->nb_frame++;
   }
 
-int ret = 0;
 
   // We don't want to send NULL frames for HW encoding
   // because that closes the encoder: not something we want
@@ -999,8 +998,6 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
   } else {
     // We need to set the pts at EOF to the *end* of the last packet
     // in order to avoid discarding any queued packets
-    // XXX check to see whether we can remove this entirely
-    //     if we can reuse cuda_flush for x264 ?
     int64_t next_pts = AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type ?
       ictx->next_pts_v : ictx->next_pts_a;
     av_buffersrc_close(filter->src_ctx, next_pts, AV_BUFFERSRC_FLAG_PUSH);
@@ -1020,51 +1017,16 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
     } else if (ret < 0) proc_err("Error consuming the filtergraph\n");
     ret = encode(encoder, frame, octx, ost);
     av_frame_unref(frame);
+    // Ror HW we keep the encoder open so will only get EAGAIN.
+    // Return EOF in place of EAGAIN for to terminate the flush
+    if (frame == NULL && AV_HWDEVICE_TYPE_NONE != octx->hw_type &&
+        AVERROR(EAGAIN) == ret && !inf) return AVERROR_EOF;
     if (frame == NULL) return ret;
   }
 
 proc_cleanup:
   return ret;
 #undef proc_err
-}
-
-static int flush_cuda(struct input_ctx *ictx, struct output_ctx *octx) {
-#define cudaf_err(msg) { \
-  char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
-  if (!ret) ret = AVERROR(EINVAL); \
-  if (ret < -1) av_strerror(ret, errstr, sizeof errstr); \
-  fprintf(stderr, "%s: %s\n", msg, errstr); \
-  return ret; \
-}
-  int ret = 0;
-  if (octx->vf.src_ctx) {
-    av_buffersrc_close(octx->vf.src_ctx, ictx->next_pts_v, AV_BUFFERSRC_FLAG_PUSH);
-  }
-  while (octx->vc && (!ret || ret == AVERROR(EAGAIN))) {
-    AVFrame *frame = octx->vf.frame;
-    av_frame_unref(frame);
-    ret = av_buffersink_get_frame(octx->vf.sink_ctx, frame);
-    if (ret) frame = NULL;
-    encode(octx->vc, frame, octx, octx->oc->streams[octx->vi]);
-    if (frame) av_frame_unref(frame);
-  }
-  while (octx->ac && (!ret || ret == AVERROR(EAGAIN))) {
-    // XXX check that this actually works
-    AVFrame *frame = octx->af.frame;
-    ret = av_buffersrc_write_frame(octx->af.src_ctx, NULL);
-    if (ret < 0) cudaf_err("Error flushing the audio filtergraph\n");
-    ret = av_buffersink_get_frame(octx->af.sink_ctx, frame);
-    if (!ret) encode(octx->ac, frame, octx, octx->oc->streams[octx->ai]);
-    av_frame_unref(frame);
-  }
-  av_interleaved_write_frame(octx->oc, NULL); // flush muxer
-  ret = av_write_trailer(octx->oc);
-  if (ret < 0) cudaf_err("transcoder: Unable to write trailer");
-  if (!(octx->oc->oformat->flags & AVFMT_NOFILE) && octx->oc->pb) {
-    avio_closep(&octx->oc->pb);
-  }
-  return 0;
-#undef cudaf_err
 }
 
 int flush_outputs(struct input_ctx *ictx, struct output_ctx *octx)
@@ -1124,7 +1086,6 @@ int transcode(struct transcode_thread *h,
   // populate output contexts
   for (i = 0; i <  nb_outputs; i++) {
       struct output_ctx *octx = &outputs[i];
-      // XXX allocate some of these fields!
       octx->fname = params[i].fname;
       octx->width = params[i].w;
       octx->height = params[i].h;
@@ -1257,10 +1218,9 @@ whileloop_end:
     av_packet_unref(&ipkt);
   }
 
+  // flush outputs
   for (i = 0; i < nb_outputs; i++) {
-    // XXX check to see if we can do this for x264 as well ?
-    if (AV_HWDEVICE_TYPE_CUDA == ictx->hw_type) ret = flush_cuda(ictx, &outputs[i]);
-    else ret = flush_outputs(ictx, &outputs[i]);
+    ret = flush_outputs(ictx, &outputs[i]);
     if (ret < 0) main_err("transcoder: Unable to fully flush outputs")
     outputs[i].nb_frame = 0;
   }
