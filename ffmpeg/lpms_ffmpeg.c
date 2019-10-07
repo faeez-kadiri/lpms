@@ -215,7 +215,7 @@ static void free_output(struct output_ctx *octx)
     avformat_free_context(octx->oc);
     octx->oc = NULL;
   }
-  if (octx->vc) avcodec_free_context(&octx->vc);
+  if (octx->vc && AV_HWDEVICE_TYPE_NONE == octx->hw_type) avcodec_free_context(&octx->vc);
   if (octx->ac) avcodec_free_context(&octx->ac);
   free_filter(&octx->vf);
   free_filter(&octx->af);
@@ -278,6 +278,7 @@ static enum AVPixelFormat get_hw_pixfmt(AVCodecContext *vc, const enum AVPixelFo
   // XXX Ideally this would be auto initialized by the HW device ctx
   //     However the initialization doesn't occur in time to set up filters
   //     So we do it here. Also see avcodec_get_hw_frames_parameters
+  av_buffer_unref(&vc->hw_frames_ctx);
   vc->hw_frames_ctx = av_hwframe_ctx_alloc(vc->hw_device_ctx);
   if (!vc->hw_frames_ctx) {
     fprintf(stderr, "Unable to allocate hwframe context for decoding\n");
@@ -694,7 +695,10 @@ open_output_err:
 static void free_input(struct input_ctx *inctx)
 {
   if (inctx->ic) avformat_close_input(&inctx->ic);
-  if (inctx->vc) avcodec_free_context(&inctx->vc);
+  if (inctx->vc) {
+    if (inctx->vc->hw_device_ctx) av_buffer_unref(&inctx->vc->hw_device_ctx);
+    avcodec_free_context(&inctx->vc);
+  }
   if (inctx->ac) avcodec_free_context(&inctx->ac);
   if (inctx->hw_device_ctx) av_buffer_unref(&inctx->hw_device_ctx);
 }
@@ -1230,6 +1234,9 @@ transcode_cleanup:
   if (dframe) av_frame_free(&dframe);
   ictx->flushed = 0;
   if (ictx->first) av_packet_free(&ictx->first);
+  if (ictx->ac) avcodec_free_context(&ictx->ac);
+  if (ictx->vc && AV_HWDEVICE_TYPE_NONE == ictx->hw_type) avcodec_free_context(&ictx->vc);
+  for (i = 0; i < nb_outputs; i++) free_output(&outputs[i]);
   return ret == AVERROR_EOF ? 0 : ret;
 #undef main_err
 }
@@ -1296,7 +1303,10 @@ void lpms_transcode_stop(struct transcode_thread *handle) {
 
   pthread_mutex_lock(&handle->mu);
   free_input(&handle->ictx);
-  for (i = 0; i < MAX_OUTPUT_SIZE; i++) free_output(&handle->outputs[i]);
+  for (i = 0; i < MAX_OUTPUT_SIZE; i++) {
+    free_output(&handle->outputs[i]);
+    if (handle->outputs[i].vc) avcodec_free_context(&handle->outputs[i].vc);
+  }
   pthread_mutex_unlock(&handle->mu);
 
   free(handle);
