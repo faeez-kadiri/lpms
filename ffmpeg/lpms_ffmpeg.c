@@ -303,12 +303,14 @@ static enum AVPixelFormat get_hw_pixfmt(AVCodecContext *vc, const enum AVPixelFo
     return AV_PIX_FMT_NONE;
   }
 
+/*
 fprintf(stderr, "selected format: hw %s sw %s\n",
 av_get_pix_fmt_name(frames->format), av_get_pix_fmt_name(frames->sw_format));
 const enum AVPixelFormat *p;
 for (p = pix_fmts; *p != -1; p++) {
 fprintf(stderr,"possible format: %s\n", av_get_pix_fmt_name(*p));
 }
+*/
 
   return frames->format;
 }
@@ -773,6 +775,7 @@ static int open_audio_decoder(input_params *params, struct input_ctx *ctx)
   } else {
     AVCodecContext * ac = avcodec_alloc_context3(codec);
     if (!ac) ad_err("Unable to alloc audio codec\n");
+    if (ctx->ac) fprintf(stderr, "Audio context already open! %p\n", ctx->ac);
     ctx->ac = ac;
     ret = avcodec_parameters_to_context(ac, ic->streams[ctx->ai]->codecpar);
     if (ret < 0) ad_err("Unable to assign audio params\n");
@@ -906,9 +909,6 @@ static int mux(AVPacket *pkt, AVRational tb, struct output_ctx *octx, AVStream *
   if (AVMEDIA_TYPE_AUDIO == ost->codecpar->codec_type) {
       if (octx->drop_ts == AV_NOPTS_VALUE) octx->drop_ts = pkt->pts;
       if (pkt->pts && pkt->pts == octx->drop_ts) return 0;
-  }
-  if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type) {
-    //fprintf(stderr, "Muxing video\n");
   }
 
   return av_interleaved_write_frame(octx->oc, pkt);
@@ -1075,7 +1075,6 @@ int transcode(struct transcode_thread *h,
   if (!inp) main_err("transcoder: Missing input params\n")
 
   if (!ictx->ic->pb) {
-    fprintf(stderr, "Re-opening input\n");
     ret = avio_open(&ictx->ic->pb, inp->fname, AVIO_FLAG_READ);
     if (ret < 0) main_err("Unable to reopen file");
     // XXX check to see if we can also reuse decoder for sw decoding
@@ -1107,12 +1106,10 @@ int transcode(struct transcode_thread *h,
       if (!h->initialized || AV_HWDEVICE_TYPE_NONE == octx->hw_type) {
         ret = open_output(octx, ictx);
         if (ret < 0) main_err("transcoder: Unable to open output");
-        fprintf(stderr, "Doing full reopen of output incl encoders\n");
         continue;
       }
 
-      // reopen output
-fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
+      // reopen output for HW encoding
 
       AVOutputFormat *fmt = av_guess_format(octx->muxer->name, octx->fname, NULL);
       if (!fmt) main_err("Unable to guess format for reopen\n");
@@ -1127,6 +1124,7 @@ fprintf(stderr, "Re-adding streams to encoder and reopening muxer\n");
       } else fprintf(stderr, "no video stream\n");
       // re-attach audio encoder
       if (octx->ac) {
+        // Audio encoding is BROKEN with hw enabled
         char filter_str[256];
         ret = add_audio_stream(octx, ictx);
         if (ret < 0) main_err("Unable to re-add audio stream\n");
@@ -1251,8 +1249,6 @@ int lpms_transcode(input_params *inp, output_params *params,
   if (!h->initialized) {
     int i = 0;
     int decode_a = 0, decode_v = 0;
-
-    fprintf(stderr, "Initializing new transcode thread\n");
     if (nb_outputs > MAX_OUTPUT_SIZE) {
       pthread_mutex_unlock(&h->mu);
       return lpms_ERR_OUTPUTS;
@@ -1272,11 +1268,12 @@ int lpms_transcode(input_params *inp, output_params *params,
       pthread_mutex_unlock(&h->mu);
       return ret;
     }
-
-    fprintf(stderr, "transcode thread ready\n");
   }
 
-  if (h->nb_outputs != nb_outputs) fprintf(stderr, "very bad!\n"); // XXX fix
+  if (h->nb_outputs != nb_outputs) {
+    return lpms_ERR_OUTPUTS; // Not the most accurate error...
+    pthread_mutex_unlock(&h->mu);
+  }
 
   ret = transcode(h, inp, params, results, decoded_results);
   h->initialized = 1;
