@@ -418,8 +418,7 @@ init_video_filters_cleanup:
 }
 
 
-static int init_audio_filters(struct input_ctx *ictx, struct output_ctx *octx,
-    char *filters_descr)
+static int init_audio_filters(struct input_ctx *ictx, struct output_ctx *octx)
 {
 #define af_err(msg) { \
   if (!ret) ret = -1; \
@@ -428,6 +427,7 @@ static int init_audio_filters(struct input_ctx *ictx, struct output_ctx *octx,
 }
   int ret = 0;
   char args[512];
+  char filters_descr[256];
   const AVFilter *buffersrc  = avfilter_get_by_name("abuffer");
   const AVFilter *buffersink = avfilter_get_by_name("abuffersink");
   AVFilterInOut *outputs = avfilter_inout_alloc();
@@ -449,6 +449,11 @@ static int init_audio_filters(struct input_ctx *ictx, struct output_ctx *octx,
       "time_base=%d/%d",
       ictx->ac->sample_rate, ictx->ac->sample_fmt, ictx->ac->channel_layout,
       ictx->ac->channels, time_base.num, time_base.den);
+
+  // TODO set sample format and rate based on encoder support,
+  //      rather than hardcoding
+  snprintf(filters_descr, sizeof filters_descr,
+    "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100");
 
   ret = avfilter_graph_create_filter(&af->src_ctx, buffersrc,
                                      "in", args, NULL, af->graph);
@@ -542,13 +547,19 @@ add_video_err:
 #undef vs_err
 }
 
-static int add_audio_stream(struct output_ctx *octx, struct input_ctx *ictx)
+static int add_audio_stream(struct input_ctx *ictx, struct output_ctx *octx)
 {
 #define as_err(msg) { \
   if (!ret) ret = -1; \
   fprintf(stderr, "Error adding audio stream: " msg); \
   goto add_audio_err; \
 }
+
+  if (ictx->ai < 0 || octx->da) {
+    // Don't need to add an audio stream if no input audio exists,
+    // or we're dropping the output audio stream
+    return 0;
+  }
 
   // audio stream to muxer
   int ret = 0;
@@ -567,7 +578,12 @@ static int add_audio_stream(struct output_ctx *octx, struct input_ctx *ictx)
     st->time_base = octx->ac->time_base;
     ret = avcodec_parameters_from_context(st->codecpar, octx->ac);
     if (ret < 0) as_err("Error setting audio params from encoder\n");
-  } else as_err("No audio encoder; not a copy; what is this?\n");
+  } else if (is_drop(octx->audio->name)) {
+    // Supposed to exit this function early if there's a drop
+    as_err("Shouldn't ever happen here\n");
+  } else {
+    as_err("No audio encoder; not a copy; what is this?\n");
+  }
   octx->ai = st->index;
 
   // signal whether to drop preroll audio
@@ -579,6 +595,56 @@ add_audio_err:
   return ret;
 #undef as_err
 }
+
+static int open_audio_output(struct input_ctx *ictx, struct output_ctx *octx,
+  AVOutputFormat *fmt)
+{
+#define ao_err(msg) { \
+  if (!ret) ret = -1; \
+  fprintf(stderr, msg"\n"); \
+  goto audio_output_err; \
+}
+
+  int ret = 0;
+  AVCodec *codec = NULL;
+  AVCodecContext *ac = NULL;
+
+  // add audio encoder if a decoder exists and this output requires one
+  if (ictx->ac && needs_decoder(octx->audio->name)) {
+
+    // initialize audio filters
+    ret = init_audio_filters(ictx, octx);
+    if (ret < 0) ao_err("Unable to open audio filter")
+
+    // open encoder
+    codec = avcodec_find_encoder_by_name(octx->audio->name);
+    if (!codec) ao_err("Unable to find audio encoder");
+    // open audio encoder
+    ac = avcodec_alloc_context3(codec);
+    if (!ac) ao_err("Unable to alloc audio encoder");
+    octx->ac = ac;
+    ac->sample_fmt = av_buffersink_get_format(octx->af.sink_ctx);
+    ac->channel_layout = av_buffersink_get_channel_layout(octx->af.sink_ctx);
+    ac->channels = av_buffersink_get_channels(octx->af.sink_ctx);
+    ac->sample_rate = av_buffersink_get_sample_rate(octx->af.sink_ctx);
+    ac->time_base = av_buffersink_get_time_base(octx->af.sink_ctx);
+    if (fmt->flags & AVFMT_GLOBALHEADER) ac->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    ret = avcodec_open2(ac, codec, &octx->audio->opts);
+    av_dict_free(&octx->audio->opts); // avcodec_open2 replaces this
+    if (ret < 0) ao_err("Error opening audio encoder");
+    av_buffersink_set_frame_size(octx->af.sink_ctx, ac->frame_size);
+  }
+
+  ret = add_audio_stream(ictx, octx);
+  if (ret < 0) ao_err("Error adding audio stream")
+
+audio_output_err:
+  // TODO clean up anything here?
+  return ret;
+
+#undef ao_err
+}
+
 
 static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
 {
@@ -645,38 +711,8 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     if (ret < 0) em_err("Error adding video stream\n");
   }
 
-  // add audio encoder if a decoder exists and this output requires one
-  if (ictx->ac && needs_decoder(octx->audio->name)) {
-{
-    char filter_str[256];
-    snprintf(filter_str, sizeof filter_str, "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100"); // set sample format and rate based on encoder support
-    ret = init_audio_filters(ictx, octx, filter_str);
-    if (ret < 0) em_err("Unable to open audio filter");
-}
-    codec = avcodec_find_encoder_by_name(octx->audio->name);
-    if (!codec) em_err("Unable to find audio encoder\n");
-    // open audio encoder
-    ac = avcodec_alloc_context3(codec);
-    if (!ac) em_err("Unable to alloc audio encoder\n");
-    octx->ac = ac;
-    ac->sample_fmt = av_buffersink_get_format(octx->af.sink_ctx);
-    ac->channel_layout = av_buffersink_get_channel_layout(octx->af.sink_ctx);
-    ac->channels = av_buffersink_get_channels(octx->af.sink_ctx);
-    ac->sample_rate = av_buffersink_get_sample_rate(octx->af.sink_ctx);
-    ac->time_base = av_buffersink_get_time_base(octx->af.sink_ctx);
-    if (fmt->flags & AVFMT_GLOBALHEADER) ac->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    ret = avcodec_open2(ac, codec, &octx->audio->opts);
-    av_dict_free(&octx->audio->opts); // avcodec_open2 replaces this
-    if (ret < 0) em_err("Error opening audio encoder\n");
-    av_buffersink_set_frame_size(octx->af.sink_ctx, ac->frame_size);
-  }
-
-  // add audio stream if input contains audio
-  inp_has_stream = ictx->ai >= 0;
-  if (inp_has_stream && !octx->da) {
-    ret = add_audio_stream(octx, ictx);
-    if (ret < 0) em_err("Error adding audio stream\n");
-  }
+  ret = open_audio_output(ictx, octx, fmt);
+  if (ret < 0) em_err("Error opening audio output\n");
 
   if (!(fmt->flags & AVFMT_NOFILE)) {
     ret = avio_open(&octx->oc->pb, octx->fname, AVIO_FLAG_WRITE);
@@ -1115,6 +1151,7 @@ int transcode(struct transcode_thread *h,
       if (!fmt) main_err("Unable to guess format for reopen\n");
       ret = avformat_alloc_output_context2(&octx->oc, fmt, NULL, octx->fname);
       if (ret < 0) main_err("Unable to alloc reopened out context\n");
+
       // re-attach video encoder
       if (octx->vc) {
         ret = add_video_stream(octx, ictx);
@@ -1122,16 +1159,11 @@ int transcode(struct transcode_thread *h,
         ret = init_video_filters(ictx, octx);
         if (ret < 0) main_err("Unable to re-open video filter\n")
       } else fprintf(stderr, "no video stream\n");
+
       // re-attach audio encoder
-      if (octx->ac) {
-        // Audio encoding is BROKEN with hw enabled
-        char filter_str[256];
-        ret = add_audio_stream(octx, ictx);
-        if (ret < 0) main_err("Unable to re-add audio stream\n");
-        snprintf(filter_str, sizeof filter_str, "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=44100"); // set sample format and rate based on encoder support
-        ret = init_audio_filters(ictx, octx, filter_str);
-        if (ret < 0) main_err("Unable to open audio filter\n")
-      }
+      ret = open_audio_output(ictx, octx, fmt);
+      if (ret < 0) main_err("Unable to re-add audio stream\n");
+
       if (!(fmt->flags & AVFMT_NOFILE)) {
         ret = avio_open(&octx->oc->pb, octx->fname, AVIO_FLAG_WRITE);
         if (ret < 0) main_err("Error re-opening output file\n");

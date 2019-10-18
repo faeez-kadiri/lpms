@@ -558,8 +558,6 @@ func TestNvidia_RepeatedSpecialOpts(t *testing.T) {
 		t.Error(err)
 	}
 
-	//run("ls -lha && exit 1")
-
 	// At some point we forgot to set the muxer type in reopened outputs
 	// This used to cause an error, so just check that it's resolved
 	in := &TranscodeOptionsIn{Accel: Nvidia}
@@ -600,7 +598,12 @@ func TestNvidia_API_MixedOutput(t *testing.T) {
 			VideoEncoder: ComponentOptions{Name: "copy"},
 			Muxer:        ComponentOptions{Name: "md5"},
 		}, TranscodeOptions{
-			Oname:   fmt.Sprintf("%s/nv_%d.ts", dir, i),
+			Oname:        fmt.Sprintf("%s/nv_%d.ts", dir, i),
+			Profile:      profile,
+			AudioEncoder: ComponentOptions{Name: "copy"},
+			Accel:        Nvidia,
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/nv_audio_encode_%d.ts", dir, i),
 			Profile: profile,
 			Accel:   Nvidia,
 		}, TranscodeOptions{
@@ -633,6 +636,7 @@ func TestNvidia_API_MixedOutput(t *testing.T) {
       ffprobe -count_frames -show_streams -select_streams v ffmpeg_nv_$1.ts | grep nb_read_frames=246
       ffprobe -count_frames -show_streams -select_streams v nv_$1.ts | grep nb_read_frames=246
       ffprobe -count_frames -show_streams -select_streams v sw_$1.ts | grep nb_read_frames=246
+      ffprobe -count_frames -show_streams -select_streams v nv_audio_encode_$1.ts | grep nb_read_frames=246
 
     # check image quality
     ffmpeg -loglevel warning -i nv_$1.ts -i ffmpeg_nv_$1.ts \
@@ -645,6 +649,7 @@ func TestNvidia_API_MixedOutput(t *testing.T) {
     grep -Po 'All:\K\d+.\d+' sw_stats_$1.log | \
       awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
 
+    # Really should check relevant audio as well...
 
     }
 
