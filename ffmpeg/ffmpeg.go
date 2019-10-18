@@ -218,6 +218,13 @@ func (t *Transcoder) Transcode(input *TranscodeOptionsIn, ps []TranscodeOptions)
 			muxOpts.name = C.CString(p.Muxer.Name)
 			defer C.free(unsafe.Pointer(muxOpts.name))
 		}
+		// Set some default encoding options
+		if len(p.VideoEncoder.Name) <= 0 && len(p.VideoEncoder.Opts) <= 0 {
+			p.VideoEncoder.Opts = map[string]string{
+				"forced-idr": "1",
+				"flags":      "+cgop",
+			}
+		}
 		vidOpts := C.component_opts{
 			name: C.CString(encoder),
 			opts: newAVOpts(p.VideoEncoder.Opts),

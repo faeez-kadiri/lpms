@@ -693,11 +693,7 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     vc->pix_fmt = av_buffersink_get_format(octx->vf.sink_ctx); // XXX select based on encoder + input support
     if (fmt->flags & AVFMT_GLOBALHEADER) vc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 {
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "forced-idr", "1", 0);
-    av_dict_set(&opts, "flags", "+cgop", 0);
-    ret = avcodec_open2(vc, codec, &opts);
-    //ret = avcodec_open2(vc, codec, &octx->video->opts);
+    ret = avcodec_open2(vc, codec, &octx->video->opts);
     av_dict_free(&octx->video->opts); // avcodec_open2 replaces this
     if (ret < 0) em_err("Error opening video encoder\n");
 }
