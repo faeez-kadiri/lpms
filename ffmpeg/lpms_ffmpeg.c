@@ -658,7 +658,6 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
   AVOutputFormat *fmt = NULL;
   AVFormatContext *oc = NULL;
   AVCodecContext *vc  = NULL;
-  AVCodecContext *ac  = NULL;
   AVCodec *codec      = NULL;
 
   // open muxer
@@ -1006,7 +1005,7 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
   char errstr[AV_ERROR_MAX_STRING_SIZE] = {0}; \
   if (!ret) { fprintf(stderr, "u done messed up\n"); ret = AVERROR(ENOMEM); } \
   if (ret < -1) av_strerror(ret, errstr, sizeof errstr); \
-  fprintf(stderr, "%s: %s", msg, errstr); \
+  fprintf(stderr, "%s: %s\n", msg, errstr); \
   goto proc_cleanup; \
 }
   int ret = 0;
@@ -1030,7 +1029,7 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
   }
   if (inf) {
     ret = av_buffersrc_write_frame(filter->src_ctx, inf);
-    if (ret < 0) proc_err("Error feeding the filtergraph\n");
+    if (ret < 0) proc_err("Error feeding the filtergraph");
   } else {
     // We need to set the pts at EOF to the *end* of the last packet
     // in order to avoid discarding any queued packets
