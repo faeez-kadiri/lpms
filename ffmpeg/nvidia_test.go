@@ -640,12 +640,12 @@ func TestNvidia_API_MixedOutput(t *testing.T) {
 
     # check image quality
     ffmpeg -loglevel warning -i nv_$1.ts -i ffmpeg_nv_$1.ts \
-      -lavfi '[0:v][1:v]ssim=nv_stats_$1.log' -f null -
+      -lavfi "[0:v][1:v]ssim=nv_stats_$1.log" -f null -
     grep -Po 'All:\K\d+.\d+' nv_stats_$1.log | \
       awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
 
     ffmpeg -loglevel warning -i sw_$1.ts -i ffmpeg_nv_$1.ts \
-      -lavfi '[0:v][1:v]ssim=sw_stats_$1.log' -f null -
+      -lavfi "[0:v][1:v]ssim=sw_stats_$1.log" -f null -
     grep -Po 'All:\K\d+.\d+' sw_stats_$1.log | \
       awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
 
@@ -662,3 +662,91 @@ func TestNvidia_API_MixedOutput(t *testing.T) {
 	run(cmd)
 	tc.StopTranscoder()
 }
+
+func TestNvidia_API_AlternatingTimestamps(t *testing.T) {
+	// Really should refactor this test to increase commonality with other
+	// tests that also check things like SSIM, MD5 hashes, etc...
+	// See TestNvidia_API_MixedOutput / TestTranscoder_EncoderOpts / TestTranscoder_StreamCopy
+	run, dir := setupTest(t)
+	err := RTMPToHLS("../transcoder/test.ts", dir+"/out.m3u8", dir+"/out_%d.ts", "2", 0)
+	if err != nil {
+		t.Error(err)
+	}
+
+	profile := P144p30fps16x9
+	profile.Framerate = 123
+	tc := NewTranscoder()
+	idx := []int{1, 0, 3, 2}
+	for _, i := range idx {
+		in := &TranscodeOptionsIn{Fname: fmt.Sprintf("%s/out_%d.ts", dir, i)}
+		out := []TranscodeOptions{TranscodeOptions{
+			Oname:        fmt.Sprintf("%s/%d.md5", dir, i),
+			AudioEncoder: ComponentOptions{Name: "drop"},
+			VideoEncoder: ComponentOptions{Name: "copy"},
+			Muxer:        ComponentOptions{Name: "md5"},
+		}, TranscodeOptions{
+			Oname:        fmt.Sprintf("%s/nv_%d.ts", dir, i),
+			Profile:      profile,
+			AudioEncoder: ComponentOptions{Name: "copy"},
+			Accel:        Nvidia,
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/nv_audio_encode_%d.ts", dir, i),
+			Profile: profile,
+			Accel:   Nvidia,
+		}, TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/sw_%d.ts", dir, i),
+			Profile: profile,
+		}}
+		res, err := tc.Transcode(in, out)
+		if err != nil {
+			t.Error(err)
+		}
+		if res.Decoded.Frames != 120 {
+			t.Error("Did not get decoded frames", res.Decoded.Frames)
+		}
+		if res.Encoded[1].Frames != res.Encoded[2].Frames {
+			t.Error("Mismatched frame count for hw/nv")
+		}
+	}
+	cmd := `
+    function check {
+
+      # Check md5sum for stream copy / drop
+      ffmpeg -loglevel warning -i out_$1.ts -an -c:v copy -f md5 ffmpeg_$1.md5
+      diff -u $1.md5 ffmpeg_$1.md5
+
+      ffmpeg -loglevel warning -i out_$1.ts -c:a aac -ar 44100 -ac 2 \
+        -vf hwupload_cuda,fps=123,scale_cuda=w=256:h=144 -c:v h264_nvenc \
+        ffmpeg_nv_$1.ts
+
+      # sanity check ffmpeg frame count against ours
+      ffprobe -count_frames -show_streams -select_streams v ffmpeg_nv_$1.ts | grep nb_read_frames=246
+      ffprobe -count_frames -show_streams -select_streams v nv_$1.ts | grep nb_read_frames=246
+      ffprobe -count_frames -show_streams -select_streams v sw_$1.ts | grep nb_read_frames=246
+      ffprobe -count_frames -show_streams -select_streams v nv_audio_encode_$1.ts | grep nb_read_frames=246
+
+    # check image quality
+    ffmpeg -loglevel warning -i nv_$1.ts -i ffmpeg_nv_$1.ts \
+      -lavfi "[0:v][1:v]ssim=nv_stats_$1.log" -f null -
+    grep -Po 'All:\K\d+.\d+' nv_stats_$1.log | \
+      awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
+
+    ffmpeg -loglevel warning -i sw_$1.ts -i ffmpeg_nv_$1.ts \
+      -lavfi "[0:v][1:v]ssim=sw_stats_$1.log" -f null -
+    grep -Po 'All:\K\d+.\d+' sw_stats_$1.log | \
+      awk '{ if ($1 < 0.95) count=count+1 } END{ exit count > 5 }'
+
+    # Really should check relevant audio as well...
+    }
+
+
+    check 0
+    check 1
+    check 2
+    check 3
+  `
+	run(cmd)
+	tc.StopTranscoder()
+}
+
+// XXX test bframes or delayed frames
