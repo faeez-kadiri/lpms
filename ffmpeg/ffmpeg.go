@@ -245,6 +245,20 @@ func (t *Transcoder) Transcode(input *TranscodeOptionsIn, ps []TranscodeOptions)
 		params[i] = C.output_params{fname: oname, fps: fps,
 			w: C.int(w), h: C.int(h), bitrate: C.int(bitrate),
 			muxer: muxOpts, audio: audioOpts, video: vidOpts, vfilters: vfilt}
+		defer func(param *C.output_params) {
+			// Work around the ownership rules:
+			// ffmpeg normally takes ownership of the following AVDictionary options
+			// However, if we don't pass these opts to ffmpeg, then we need to free
+			if param.muxer.opts != nil {
+				C.av_dict_free(&param.muxer.opts)
+			}
+			if param.audio.opts != nil {
+				C.av_dict_free(&param.audio.opts)
+			}
+			if param.video.opts != nil {
+				C.av_dict_free(&param.video.opts)
+			}
+		}(&params[i])
 	}
 	var device *C.char
 	if input.Device != "" {

@@ -630,7 +630,6 @@ static int open_audio_output(struct input_ctx *ictx, struct output_ctx *octx,
     ac->time_base = av_buffersink_get_time_base(octx->af.sink_ctx);
     if (fmt->flags & AVFMT_GLOBALHEADER) ac->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     ret = avcodec_open2(ac, codec, &octx->audio->opts);
-    av_dict_free(&octx->audio->opts); // avcodec_open2 replaces this
     if (ret < 0) ao_err("Error opening audio encoder");
     av_buffersink_set_frame_size(octx->af.sink_ctx, ac->frame_size);
   }
@@ -691,11 +690,8 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     }
     vc->pix_fmt = av_buffersink_get_format(octx->vf.sink_ctx); // XXX select based on encoder + input support
     if (fmt->flags & AVFMT_GLOBALHEADER) vc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-{
     ret = avcodec_open2(vc, codec, &octx->video->opts);
-    av_dict_free(&octx->video->opts); // avcodec_open2 replaces this
     if (ret < 0) em_err("Error opening video encoder\n");
-}
     octx->hw_type = ictx->hw_type;
   }
 
@@ -715,7 +711,6 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
   }
 
   ret = avformat_write_header(oc, &octx->muxer->opts);
-  av_dict_free(&octx->muxer->opts); // avformat_write_header replaces this
   if (ret < 0) em_err("Error writing header\n");
 
   return 0;
@@ -757,7 +752,7 @@ static int open_video_decoder(input_params *params, struct input_ctx *ctx)
         AV_HWDEVICE_TYPE_CUDA == params->hw_type) {
       AVCodec *c = avcodec_find_decoder_by_name("h264_cuvid");
       if (c) codec = c;
-      else fprintf(stderr, "Cuvid decover not found; defaulting to software\n");
+      else fprintf(stderr, "Cuvid decoder not found; defaulting to software\n");
     }
     AVCodecContext *vc = avcodec_alloc_context3(codec);
     if (!vc) dd_err("Unable to alloc video codec\n");
